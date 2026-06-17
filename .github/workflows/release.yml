@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          # INPUT_TAG comes from workflow_dispatch and is set by a repo
+          # maintainer; GITHUB_REF_NAME is GitHub-validated on tag push.
+          # Validate shape to prevent ref-style injection.
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid tag '$TAG' (expected vX.Y.Z)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version consistency
+        env:
+          EXPECTED: ${{ steps.tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          err=0
+          check() {
+            local label="$1" actual="$2"
+            if [ "$actual" != "$EXPECTED" ]; then
+              echo "::error::$label mismatch: expected '$EXPECTED', got '$actual'"
+              err=1
+            else
+              echo "OK  $label = $actual"
+            fi
+          }
+
+          VERSION_FILE="$(cat VERSION | tr -d '[:space:]')"
+          check "VERSION file" "$VERSION_FILE"
+
+          PLUGIN_VER=$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+          check ".claude-plugin/plugin.json version" "$PLUGIN_VER"
+
+          MARKET_VER=$(python3 -c "import json;print(json.load(open('.claude-plugin/marketplace.json'))['plugins'][0]['version'])")
+          check ".claude-plugin/marketplace.json plugins[0].version" "$MARKET_VER"
+
+          if [ "$err" -ne 0 ]; then
+            echo "::error::Version mismatch detected. Bump all three locations together before tagging."
+            exit 1
+          fi
+
+      - name: Build release notes
+        id: notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${TAG}$" | head -1 || true)
+
+          {
+            echo "## What's new"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "### Commits since ${PREV_TAG}"
+              echo ""
+              git log --pretty=format:'- %s (%h)' "${PREV_TAG}..${TAG}" | head -50
+              echo ""
+            else
+              echo "Initial public release."
+              echo ""
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "### Install"
+            echo ""
+            echo '```'
+            echo "/plugin marketplace add tipsy-kereru/laplace"
+            echo "/plugin install laplace@laplace"
+            echo '```'
+          } > release_notes.md
+
+          echo "--- generated notes (head) ---"
+          head -20 release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists — updating notes."
+            gh release edit "$TAG" --notes-file release_notes.md
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes-file release_notes.md \
+              --verify-tag
+          fi
