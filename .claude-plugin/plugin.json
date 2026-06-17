@@ -2,7 +2,10 @@
   "name": "laplace",
   "version": "0.1.0",
   "description": "Local AI engineering loop execution harness for Claude Code. Converts PRDs or stories into local issues, routes each issue through scoped agent phases, runs verification, records evidence, and stops at explicit human approval gates. Works without Moon Cell; consumes .moon-cell/ profiles when present.",
-  "author": "laplace",
+  "author": {
+    "name": "tipsy-kereru",
+    "url": "https://github.com/tipsy-kereru/laplace"
+  },
   "category": "harness",
   "maturity": "draft"
 }
