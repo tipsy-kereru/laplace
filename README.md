@@ -6,6 +6,70 @@ Laplace is a Claude Code plugin for local AI engineering loop execution. It enfo
 
 Draft. MVP scope: P0-P6. See `specs/SPEC-002-laplace-claude-code-plugin.md` for the full specification.
 
+## Requirements
+
+- [Claude Code](https://claude.com/claude-code) v2.x or later
+- Python 3.7+ (stdlib only — Laplace uses `os.replace`, f-strings, and subprocess for `git`)
+- `git` on `PATH` (used by the run loop for branch state and PR creation)
+- `gh` CLI (only required for `/laplace:create-pr`; must be authenticated via `gh auth login`)
+
+## Installation
+
+Install from the public GitHub repository. Pick one path.
+
+### Path A — Marketplace (recommended)
+
+Add this repository as a plugin marketplace, then install:
+
+```
+/plugin marketplace add tipsy-kereru/laplace
+/plugin install laplace@laplace
+```
+
+Updates are resolved against the marketplace. Bump the `version` field in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`, tag a release, and users can `/plugin update laplace`.
+
+### Path B — Direct install (no marketplace)
+
+Install straight from the repository URL:
+
+```
+/plugin install tipsy-kereru/laplace
+```
+
+Or by full URL:
+
+```
+/plugin install https://github.com/tipsy-kereru/laplace
+```
+
+### Verify the install
+
+After installing, run the doctor skill from any Claude Code session in your project:
+
+```
+/laplace:doctor
+```
+
+`doctor` checks the plugin JSON, hooks, Python version, git, and `gh` auth. Then initialize the runtime workspace:
+
+```
+/laplace:init
+```
+
+This creates `.harness/` (owned by Laplace). Add `.harness/` to your project `.gitignore` if you do not want to commit runtime state.
+
+### Uninstall
+
+```
+/plugin uninstall laplace
+```
+
+Optionally remove the marketplace:
+
+```
+/plugin marketplace remove tipsy-kereru/laplace
+```
+
 ## What Laplace Does
 
 - Converts PRD or story documents into local draft issues
