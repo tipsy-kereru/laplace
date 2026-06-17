@@ -16,6 +16,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # workflow_dispatch only from main; tag-push trigger is unrestricted
+    # because a protected tag namespace is enforced by GitHub branch/tag rules.
+    if: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,6 +42,24 @@ jobs:
             echo "::error::Invalid tag '$TAG' (expected vX.Y.Z)"
             exit 1
           fi
+
+          # Tag must exist in the repo (push creates it before the run).
+          if ! git rev-parse --verify --quiet "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::Tag '${TAG}' does not exist in the repository"
+            exit 1
+          fi
+
+          # On workflow_dispatch, the supplied tag must point at HEAD to
+          # prevent releasing an arbitrary historical commit.
+          if [ -n "$INPUT_TAG" ]; then
+            TAG_COMMIT=$(git rev-parse "${TAG}^{}")
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+              echo "::error::Tag '${TAG}' (commit ${TAG_COMMIT}) is not at HEAD (${HEAD_COMMIT})"
+              exit 1
+            fi
+          fi
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
