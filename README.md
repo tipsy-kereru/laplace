@@ -256,20 +256,22 @@ When two sources disagree, higher wins:
 
 ## Command surface
 
-| Skill | Purpose |
+Slash commands live in `commands/` and invoke the corresponding procedural skill in `skills/`. (Skills are model-invoked; commands give you explicit `/laplace:<name>` entry points.)
+
+| Command | Purpose |
 |---|---|
 | `/laplace:init` | Initialize `.harness/` runtime workspace |
 | `/laplace:doctor` | Check plugin, hooks, config, test commands, Moon Cell profile |
 | `/laplace:intake <prd>` | Convert PRD/story into local draft issues |
-| `/laplace:list` | List local issues and queue state |
-| `/laplace:show <issue>` | Show issue details |
 | `/laplace:approve <issue>` | Move draft issue to approved queue |
 | `/laplace:run [issue]` | Execute one issue loop |
 | `/laplace:status` | Show current harness state |
-| `/laplace:logs <run>` | Show sanitized run logs |
 | `/laplace:report <issue>` | Generate or show issue report |
 | `/laplace:cancel [issue]` | Stop active loop safely |
 | `/laplace:create-pr <issue>` | Create GitHub PR after approval |
+| `/laplace:list` | _(planned — P5/P6)_ List local issues and queue state |
+| `/laplace:show <issue>` | _(planned — P5/P6)_ Show issue details |
+| `/laplace:logs <run>` | _(planned — P5/P6)_ Show sanitized run logs |
 
 ---
 
