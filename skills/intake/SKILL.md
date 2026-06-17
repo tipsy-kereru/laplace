@@ -1,5 +1,5 @@
 ---
-name: laplace-intake
+name: intake
 description: Convert a PRD or story document into local draft issues. Parses markdown, creates ISSUE-NNNN.md files with all required schema fields in draft status, registers them in the queue. Does not auto-approve.
 ---
 

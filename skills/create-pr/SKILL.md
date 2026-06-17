@@ -1,5 +1,5 @@
 ---
-name: laplace-create-pr
+name: create-pr
 description: Create a GitHub pull request for a review-passed issue. Generates the PR draft artifact first, records an approval entry, then creates the PR ONLY after explicit human approval. No PR is created without approval (AC-LP-015).
 ---
 

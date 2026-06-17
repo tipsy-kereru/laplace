@@ -11,7 +11,7 @@ tools: Read, Grep, Glob, Bash
 
 Review the dev agent's diff on branch `laplace/<issue-id>` against the issue's acceptance criteria. Check correctness, regressions, and maintainability. Output one of `review-passed`, `needs-fix` (with a specific actionable required-fix list), or `recommend-security-review` (with risk notes that warrant a security-agent pass).
 
-You are invoked by the `laplace-run` skill during the review phase. You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is read-only review.
+You are invoked by the `run` skill during the review phase. You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is read-only review.
 
 ## Inputs (provided by orchestrator)
 

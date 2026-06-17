@@ -1,5 +1,5 @@
 ---
-name: laplace-approve
+name: approve
 description: Move a draft issue into the approved execution queue. Explicit human approval gate — only this command transitions draft to approved. Records approval in approvals.jsonl.
 ---
 

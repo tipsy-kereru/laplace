@@ -11,7 +11,7 @@ tools: Read, Write, Edit, Grep, Glob, Bash
 
 Implement scoped changes for a single issue on branch `laplace/<issue-id>`. Produce code diff, test changes, and a short implementation summary. Capture test evidence before reporting completion. Output a `ready-for-review` or `blocked` decision.
 
-You are invoked by the `laplace-run` skill during the dev phase. You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is implementation + evidence capture.
+You are invoked by the `run` skill during the dev phase. You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is implementation + evidence capture.
 
 ## Inputs (provided by orchestrator)
 

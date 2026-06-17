@@ -5,9 +5,9 @@ Responsibilities:
   - Drive one issue through phase transitions with branch isolation
   - Capture redacted evidence into the run log
   - Enforce lock discipline around state-changing operations
-  - Provide deterministic scaffolding the laplace-run skill calls into
+  - Provide deterministic scaffolding the run skill calls into
 
-This module does NOT invoke LLM agents. The laplace-run skill instructs the
+This module does NOT invoke LLM agents. The run skill instructs the
 model; runner.py provides the deterministic operations the skill composes.
 
 stdlib + subprocess only. subprocess is used for git only and every git

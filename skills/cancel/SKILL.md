@@ -1,5 +1,5 @@
 ---
-name: laplace-cancel
+name: cancel
 description: Stop an active Laplace loop safely. Clears active-loop state, records cancellation in issue run history, releases locks. Does not delete branches or artifacts. Full body lands in P6.
 ---
 

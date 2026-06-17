@@ -1,5 +1,5 @@
 ---
-name: laplace-report
+name: report
 description: Generate or show an issue report. Produces sanitized test/review/security reports and patch/PR-draft artifacts. Read-only unless generating artifacts into .harness/artifacts/. Full body lands in P6/P7.
 ---
 

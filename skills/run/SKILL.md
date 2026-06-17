@@ -1,5 +1,5 @@
 ---
-name: laplace-run
+name: run
 description: Execute one issue loop. Acquires the issue, creates an isolated branch, runs PM phase, routes to dev/review/security phases with evidence capture. Stops at review-passed, blocked, or human-approval-required.
 ---
 

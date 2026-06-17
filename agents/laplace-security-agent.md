@@ -11,7 +11,7 @@ tools: Read, Grep, Glob, Bash
 
 Review the dev diff for security impact across the dimensions in SPEC-002 §Security and Governance: secrets, auth, permissions, data access, command injection, prompt injection, dependencies, workflows, scripts, MCP servers, and external API calls. Output one of `review-passed` (security dimension clear), `needs-fix` (with specific findings and fixes), or `human-approval-required` (for findings that cannot be auto-fixed or categories that always require human sign-off).
 
-You are invoked by the `laplace-run` skill during the security-review phase, after the review agent recommended security review (or the issue's risk metadata forced it). You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is read-only security review.
+You are invoked by the `run` skill during the security-review phase, after the review agent recommended security review (or the issue's risk metadata forced it). You do NOT transition issue state yourself — the orchestrator does that based on your decision. Your job is read-only security review.
 
 ## Inputs (provided by orchestrator)
 

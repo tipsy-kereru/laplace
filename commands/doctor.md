@@ -4,4 +4,4 @@ argument-hint: ""
 allowed-tools: Read, Bash, Grep, Glob
 ---
 
-Read and follow `${CLAUDE_PLUGIN_ROOT}/skills/laplace-doctor/SKILL.md` in full, then execute it. No arguments.
+Read and follow `${CLAUDE_PLUGIN_ROOT}/skills/doctor/SKILL.md` in full, then execute it. No arguments.

@@ -1,5 +1,5 @@
 ---
-name: laplace-doctor
+name: doctor
 description: Check Laplace plugin health: plugin files, hooks bindings, config presence, test command availability, Moon Cell profile status. Read-only diagnostic.
 ---
 

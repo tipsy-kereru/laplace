@@ -1,5 +1,5 @@
 ---
-name: laplace-status
+name: status
 description: Show current Laplace harness state. Read-only. Reports queue counts, active run, current state, evidence, and next safe action per SPEC-002 §Status Template.
 ---
 

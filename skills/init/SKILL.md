@@ -1,5 +1,5 @@
 ---
-name: laplace-init
+name: init
 description: Initialize the Laplace .harness/ runtime workspace. Creates config, routing rules, agent policy, directory tree, and .gitignore (mixed tracking policy) without modifying source code.
 ---
 
