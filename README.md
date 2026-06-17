@@ -102,6 +102,12 @@ Optionally remove the marketplace:
 
 ---
 
+## Usage guide
+
+For detailed walkthroughs with realistic examples (first-time setup, bug-fix loop, dependency gate, cancel/resume, blocked issues), see **[docs/USAGE.md](docs/USAGE.md)**.
+
+The quick start below covers the happy path. The usage guide covers the edge cases.
+
 ## Quick start — an end-to-end loop
 
 A typical Laplace session, from spec to PR:
@@ -286,6 +292,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 
 ## Source of truth
 
+- Usage guide: `docs/USAGE.md`
 - Specification: `specs/SPEC-002-laplace-claude-code-plugin.md`
 - Harness design (this project): `.moon-cell/docs/harness/`
 - Runtime state: `.harness/` (owned by Laplace, created by `/laplace:init`)
