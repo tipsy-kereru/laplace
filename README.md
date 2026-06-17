@@ -146,18 +146,26 @@ At any gate that needs a human (auth change, dependency add, release, production
 
 Each approved issue flows through a fixed phase pipeline. Phases are agent **roles**, not free-form prompts — each agent has a constrained contract.
 
+```mermaid
+flowchart LR
+    intake([intake]) --> draft[(draft)]
+    draft -->|/laplace:approve| approved[(approved)]
+    approved -->|"/laplace:run"| PM["PM<br/>(scope)"]
+    PM --> Dev["Dev<br/>(impl)"]
+    Dev --> Review["Review<br/>(gate)"]
+    Review --> Security["Security<br/>(gate)"]
+    Security --> RC[/"RC<br/>(release-candidate)"/]
+
+    PM -.->|ambiguous scope| blocked[/blocked/]
+    Review -.->|findings| needsfix[/needs-fix/]
+    Security -.->|risky category| human[/human-approval-required/]
+
+    blocked -.->|resolve + /laplace:run| PM
+    needsfix -.->|/laplace:run| Dev
+    human -.->|/laplace:approve + /laplace:run| Security
 ```
-intake ─▶ [draft] ─▶ approve ─▶ [approved]
-                                   │
-                                   ▼ /laplace:run
-        ┌──────────────────────────────────────────────────┐
-        │  PM  ──▶  Dev  ──▶  Review  ──▶  Security  ──▶  RC │
-        │ (scope)  (impl)   (gate)      (gate)        (release-candidate) │
-        └──────────────────────────────────────────────────┘
-                         │                    │
-                         ▼                    ▼
-                  blocked / needs-fix   human-approval-required
-```
+
+Each approved issue flows through PM → Dev → Review → Security. Any gate can divert the issue to `blocked`, `needs-fix`, or `human-approval-required`; resolving the diversion and re-running `/laplace:run` resumes from the last legal state.
 
 - **PM** (`laplace-pm-agent`): clarifies scope, acceptance criteria, technical notes. Bounded clarification attempts.
 - **Dev** (`laplace-dev-agent`): implements scoped changes + tests on an isolated branch `laplace/<issue-id>`.
