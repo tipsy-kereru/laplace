@@ -86,6 +86,9 @@ logs/
 *.seed
 *.pid.lock
 
+# ---- Laplace runtime state (local) ----
+.harness/
+
 # ---- Local notes / scratch ----
 .scratch/
 *.tmp
