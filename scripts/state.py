@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""State engine for Laplace's .harness/ runtime workspace.
+
+Responsibilities:
+  - Atomic JSON read/write (write to tmp then os.replace; never partial)
+  - File-based locking under .harness/state/locks/<issue-id>.lock with PID + ts
+  - State-machine validation per SPEC-002 §State Machine
+  - CLI entry point for init / status / list / show / approve / transition /
+    run-start / run-end / lock / unlock / selftest
+
+All persisted evidence is passed through redaction.py before write (G-LP-003).
+stdlib-only.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
+# --- Loop limit constants (G-LP-004). Mirror policy.py and config.yml template. -
+
+MAX_FIX_ATTEMPTS = 3
+MAX_PM_CLARIFICATION_ATTEMPTS = 2
+MAX_SECURITY_FIX_ATTEMPTS = 2
+MAX_RUNTIME_MINUTES_PER_ISSUE = 60
+MAX_FILES_CHANGED_WITHOUT_APPROVAL = 20
+MAX_DIFF_LINES_WITHOUT_APPROVAL = 1000
+MAX_STOP_HOOK_ITERATIONS = 12
+
+LOCK_TTL_SECONDS = 60 * 60  # stale-lock detection window (60 min default)
+
+# --- State machine (SPEC-002 §State Machine) -----------------------------------
+
+VALID_TRANSITIONS: Dict[str, List[str]] = {
+    "draft": ["approved"],
+    "approved": ["pm-review", "blocked"],
+    "pm-review": ["ready-for-dev", "blocked"],
+    "ready-for-dev": ["in-progress", "blocked"],
+    "in-progress": ["review", "blocked", "needs-fix", "human-approval-required"],
+    "review": ["needs-fix", "review-passed", "security-review", "blocked",
+               "human-approval-required"],
+    "security-review": ["needs-fix", "review-passed", "blocked",
+                        "human-approval-required"],
+    "needs-fix": ["in-progress", "blocked", "human-approval-required"],
+    "review-passed": ["release-candidate", "blocked"],
+    "release-candidate": ["done", "blocked"],
+    "done": [],
+    "blocked": ["human-resolution"],
+    "human-resolution": ["draft", "approved", "pm-review", "ready-for-dev",
+                          "in-progress", "review", "needs-fix", "review-passed",
+                          "release-candidate", "done", "cancelled"],
+    "human-approval-required": [],
+    "cancelled": [],
+}
+
+QUEUE_STATES = ["draft", "approved", "in-progress", "blocked", "release-candidate"]
+
+TERMINAL_STATES = {"review-passed", "security-passed", "release-candidate",
+                   "done", "blocked", "max-attempts-exceeded",
+                   "human-approval-required", "cancelled"}
+
+DEFAULT_QUEUE: Dict[str, List[str]] = {s: [] for s in QUEUE_STATES}
+
+# --- Paths ----------------------------------------------------------------------
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _harness_root(target: Optional[str] = None) -> str:
+    return os.path.abspath(target or os.getcwd())
+
+
+def _state_dir(target: Optional[str] = None) -> str:
+    return os.path.join(_harness_root(target), ".harness", "state")
+
+
+def _issues_dir(target: Optional[str] = None) -> str:
+    return os.path.join(_harness_root(target), ".harness", "issues")
+
+
+# --- Redaction integration (G-LP-003) ------------------------------------------
+
+def _redact_evidence(text: str) -> str:
+    """Apply redaction to any evidence string before it is persisted."""
+    try:
+        from redaction import redact  # local import; same-scripts dir
+    except ImportError:
+        # Fallback: in-place path so tests that import this module directly
+        # without scripts/ on sys.path still get redaction via late binding.
+        sys.path.insert(0, HERE)
+        try:
+            from redaction import redact  # type: ignore
+        except Exception:
+            return text
+    return redact(text)
+
+
+# --- Atomic JSON I/O ------------------------------------------------------------
+
+def _atomic_write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: str, default: Any = None) -> Any:
+    if not os.path.exists(path):
+        return default
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# --- File locking ---------------------------------------------------------------
+
+def _lock_path(issue_id: str, target: Optional[str] = None) -> str:
+    safe = issue_id.replace("/", "_")
+    return os.path.join(_state_dir(target), "locks", f"{safe}.lock")
+
+
+def _read_lock(path: str) -> Optional[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {"pid": -1, "ts": 0, "corrupt": True}
+
+
+def acquire_lock(issue_id: str, target: Optional[str] = None,
+                 ttl: int = LOCK_TTL_SECONDS) -> Tuple[bool, str]:
+    """Try to acquire a lock for an issue. Returns (ok, reason).
+    Stale locks (older than ttl seconds, or whose PID is not alive) are reused.
+    """
+    os.makedirs(os.path.dirname(_lock_path(issue_id, target)), exist_ok=True)
+    existing = _read_lock(_lock_path(issue_id, target))
+    if existing and not existing.get("corrupt"):
+        pid = existing.get("pid", -1)
+        age = time.time() - float(existing.get("ts", 0))
+        if _pid_alive(pid) and age < ttl:
+            return False, f"locked by pid={pid}"
+    payload = {"pid": os.getpid(), "ts": time.time(), "issue_id": issue_id}
+    _atomic_write_json(_lock_path(issue_id, target), payload)
+    return True, "acquired"
+
+
+def release_lock(issue_id: str, target: Optional[str] = None) -> Tuple[bool, str]:
+    path = _lock_path(issue_id, target)
+    if not os.path.exists(path):
+        return True, "no lock present"
+    os.remove(path)
+    return True, "released"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+# --- State machine --------------------------------------------------------------
+
+def validate_transition(from_state: str, to_state: str) -> Tuple[bool, str]:
+    if from_state == to_state:
+        return True, "no-op"
+    allowed = VALID_TRANSITIONS.get(from_state)
+    if allowed is None:
+        return False, f"unknown source state: {from_state}"
+    if to_state not in allowed:
+        return False, f"invalid transition: {from_state} -> {to_state}"
+    return True, "ok"
+
+
+# --- Tasks / queue helpers ------------------------------------------------------
+
+def _tasks_path(target: Optional[str] = None) -> str:
+    return os.path.join(_state_dir(target), "tasks.json")
+
+
+def _queue_path(target: Optional[str] = None) -> str:
+    return os.path.join(_state_dir(target), "queue.json")
+
+
+def _approvals_path(target: Optional[str] = None) -> str:
+    return os.path.join(_state_dir(target), "approvals.jsonl")
+
+
+def _runs_dir(target: Optional[str] = None) -> str:
+    return os.path.join(_state_dir(target), "runs")
+
+
+def _load_tasks(target: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    data = _read_json(_tasks_path(target), default={})
+    return data or {}
+
+
+def _load_queue(target: Optional[str] = None) -> Dict[str, List[str]]:
+    data = _read_json(_queue_path(target), default=None)
+    if data is None:
+        return json.loads(json.dumps(DEFAULT_QUEUE))
+    # Ensure all QUEUE_STATES keys exist.
+    out = json.loads(json.dumps(DEFAULT_QUEUE))
+    out.update({k: data.get(k, []) for k in QUEUE_STATES})
+    return out
+
+
+def _save_tasks(tasks: Dict[str, Any], target: Optional[str] = None) -> None:
+    _atomic_write_json(_tasks_path(target), tasks)
+
+
+def _save_queue(queue: Dict[str, List[str]], target: Optional[str] = None) -> None:
+    _atomic_write_json(_queue_path(target), queue)
+
+
+def _append_approval(issue_id: str, action: str, user: str,
+                     target: Optional[str] = None) -> None:
+    line = json.dumps({
+        "ts": time.time(),
+        "issue_id": _redact_evidence(issue_id),
+        "action": _redact_evidence(action),
+        "user": _redact_evidence(user),
+    })
+    path = _approvals_path(target)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# --- Config template (G-LP-004) -------------------------------------------------
+
+CONFIG_YML_TEMPLATE = """\
+# Laplace runtime configuration. Generated by `state.py init`.
+# Hard-safety limits below cannot be weakened by lower-precedence policy layers.
+limits:
+  max_fix_attempts: %d
+  max_pm_clarification_attempts: %d
+  max_security_fix_attempts: %d
+  max_runtime_minutes_per_issue: %d
+  max_files_changed_without_approval: %d
+  max_diff_lines_without_approval: %d
+  max_stop_hook_iterations: %d
+policy:
+  require_approval_for:
+    - git_push
+    - pr_creation
+    - release_publish
+    - dependency_install
+    - mcp_server_add
+    - auth_permission_change
+    - data_access_change
+    - workflow_script_release_change
+redaction:
+  enabled: true
+  store_raw_command_output: false
+""" % (
+    MAX_FIX_ATTEMPTS,
+    MAX_PM_CLARIFICATION_ATTEMPTS,
+    MAX_SECURITY_FIX_ATTEMPTS,
+    MAX_RUNTIME_MINUTES_PER_ISSUE,
+    MAX_FILES_CHANGED_WITHOUT_APPROVAL,
+    MAX_DIFF_LINES_WITHOUT_APPROVAL,
+    MAX_STOP_HOOK_ITERATIONS,
+)
+
+ROUTING_RULES_TEMPLATE = """\
+# Laplace routing rules. Editable; lower precedence than hard safety + config.
+routes:
+  - match: { type: feature, risk: low }
+    agent: dev
+    next_phase: review
+  - match: { type: feature, risk: high }
+    agent: dev
+    next_phase: security-review
+  - match: { type: bug, risk: low }
+    agent: dev
+    next_phase: review
+  - match: { type: security }
+    agent: security
+    next_phase: security-review
+"""
+
+AGENT_POLICY_TEMPLATE = """\
+# Agent policy. Defines per-agent constraints; cannot weaken hard safety.
+agents:
+  pm:
+    model_class: reasoning-heavy
+    can_edit_issue: true
+    can_run_commands: false
+  dev:
+    model_class: implementation
+    can_edit_code: true
+    can_push: false
+  review:
+    model_class: reasoning-heavy
+    can_edit_code: false
+  security:
+    model_class: reasoning-heavy
+    can_edit_code: false
+  release:
+    model_class: implementation
+    can_publish: false
+"""
+
+GITIGNORE_TEMPLATE = """\
+# Laplace .harness/ mixed tracking policy.
+# Tracked (project-wide baseline): config, routing rules, agent policy, memory.
+# Ignored (local runtime state, logs, artifacts, issue drafts):
+state/
+logs/
+artifacts/
+issues/
+"""
+
+MEMORY_PROJECT_TEMPLATE = """\
+# Project memory
+
+One-paragraph description of the project. Updated by PM agent during intake.
+"""
+
+MEMORY_DECISIONS_TEMPLATE = """\
+# Decisions
+
+Append-only decision log. Each entry: date - decision - rationale.
+"""
+
+MEMORY_CONSTRAINTS_TEMPLATE = """\
+# Constraints
+
+Non-negotiable project constraints (compliance, security, architectural).
+"""
+
+MEMORY_KNOWN_FAILURES_TEMPLATE = """\
+# Known failures
+
+Patterns that previously caused review/security failures. Used to short-circuit
+the fix loop when the same failure shape recurs.
+"""
+
+DIRECTORY_TREE = [
+    "issues",
+    "state",
+    "state/locks",
+    "state/runs",
+    "memory",
+    "logs",
+    "logs/agent-runs",
+    "logs/test-runs",
+    "artifacts",
+    "artifacts/patches",
+    "artifacts/pr-drafts",
+    "artifacts/reports",
+    "artifacts/release",
+]
+
+
+def cmd_init(target: Optional[str] = None) -> int:
+    """Create the .harness/ tree per SPEC-002 §Runtime State Layout. Does NOT
+    modify any source code outside .harness/.
+    """
+    root = _harness_root(target)
+    harness = os.path.join(root, ".harness")
+    os.makedirs(harness, exist_ok=True)
+    for rel in DIRECTORY_TREE:
+        os.makedirs(os.path.join(harness, rel), exist_ok=True)
+    _atomic_write_text(os.path.join(harness, "config.yml"), CONFIG_YML_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, "routing-rules.yml"), ROUTING_RULES_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, "agent-policy.yml"), AGENT_POLICY_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, ".gitignore"), GITIGNORE_TEMPLATE)
+    # State seed files
+    _save_tasks({}, target=target)
+    _save_queue(DEFAULT_QUEUE, target=target)
+    # Empty approvals.jsonl (touch)
+    ap = _approvals_path(target)
+    if not os.path.exists(ap):
+        _atomic_write_text(ap, "")
+    # Memory seeds
+    _atomic_write_text(os.path.join(harness, "memory", "project.md"), MEMORY_PROJECT_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, "memory", "decisions.md"), MEMORY_DECISIONS_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, "memory", "constraints.md"), MEMORY_CONSTRAINTS_TEMPLATE)
+    _atomic_write_text(os.path.join(harness, "memory", "known-failures.md"), MEMORY_KNOWN_FAILURES_TEMPLATE)
+    # Profile snapshot placeholder (filled by profile.py in P6 when .moon-cell/ present)
+    snapshot_path = os.path.join(harness, "state", "profile-snapshot.json")
+    if not os.path.exists(snapshot_path):
+        _atomic_write_json(snapshot_path, {
+            "status": "not-yet-consumed",
+            "moon_cell_present": os.path.isdir(os.path.join(root, ".moon-cell")),
+            "ts": time.time(),
+        })
+    print(f"Initialized {harness}")
+    if not os.path.isdir(os.path.join(root, ".moon-cell")):
+        print(
+            "Moon Cell profile not found.\n"
+            "Laplace can run with default local policy.\n"
+            "Recommended: use Moon Cell to generate a project-specific harness profile."
+        )
+    else:
+        print("Moon Cell profile detected. Snapshot will be populated by profile.py (P6).")
+    print("Next: /laplace:doctor")
+    return 0
+
+
+def _format_status(target: Optional[str] = None) -> str:
+    tasks = _load_tasks(target)
+    queue = _load_queue(target)
+    # Find an active in-progress run, if any.
+    active_run: Optional[Dict[str, Any]] = None
+    active_issue: Optional[str] = None
+    runs_dir = _runs_dir(target)
+    for tid, meta in tasks.items():
+        if meta.get("status") == "in-progress" and meta.get("run_id"):
+            run_path = os.path.join(runs_dir, f"{meta['run_id']}.json")
+            run = _read_json(run_path, default=None)
+            if run:
+                active_run = run
+                active_issue = tid
+                break
+    lines: List[str] = ["Harness status.", ""]
+    lines.append("Queue:")
+    for state in QUEUE_STATES:
+        lines.append(f"  {state}: {len(queue.get(state, []))}")
+    lines.append("")
+    lines.append("Active run:")
+    if active_run and active_issue:
+        lines.append(f"  Run: {active_run.get('run_id', '?')}")
+        lines.append(f"  Issue: {active_issue}")
+        lines.append(f"  State: {tasks[active_issue].get('status', '?')}")
+        lines.append(f"  Agent: {active_run.get('agent', '?')}")
+        attempt = active_run.get("attempt", 0)
+        lines.append(f"  Attempt: {attempt}/{MAX_FIX_ATTEMPTS}")
+        evidence = active_run.get("evidence", []) or []
+        last = evidence[-1] if evidence else "none"
+        lines.append(f"  Last evidence: {last}")
+    else:
+        lines.append("  (no active run)")
+    lines.append("")
+    lines.append("Next action:")
+    if queue.get("approved") and not active_run:
+        first = queue["approved"][0]
+        lines.append(f"  /laplace:run {first}")
+    elif queue.get("draft"):
+        first = queue["draft"][0]
+        lines.append(f"  /laplace:approve {first}")
+    elif active_run:
+        lines.append("  await current run completion or /laplace:status")
+    else:
+        lines.append("  /laplace:intake <prd> to create draft issues")
+    return "\n".join(lines)
+
+
+def cmd_status(target: Optional[str] = None) -> int:
+    print(_format_status(target))
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    tasks = _load_tasks(args.target)
+    rows = []
+    for tid, meta in sorted(tasks.items()):
+        if args.status and meta.get("status") != args.status:
+            continue
+        rows.append(f"{tid}\t{meta.get('status', '?')}\t{meta.get('updated_at', '?')}")
+    if not rows:
+        print("(no issues)")
+    else:
+        print("\n".join(rows))
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    issue_path = os.path.join(_issues_dir(args.target), f"{args.issue_id}.md")
+    if not os.path.exists(issue_path):
+        print(f"issue not found: {args.issue_id}", file=sys.stderr)
+        return 1
+    with open(issue_path, "r", encoding="utf-8") as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
+def _set_issue_state(issue_id: str, new_state: str, target: Optional[str] = None,
+                     run_id: Optional[str] = None, attempt: Optional[int] = None) -> None:
+    tasks = _load_tasks(target)
+    t = tasks.get(issue_id, {})
+    t["status"] = new_state
+    t["updated_at"] = time.time()
+    if run_id is not None:
+        t["run_id"] = run_id
+    if attempt is not None:
+        t["attempts"] = attempt
+    tasks[issue_id] = t
+    _save_tasks(tasks, target=target)
+    # Update queue: insert into the matching queue state if it's a queue-tracked state.
+    queue = _load_queue(target)
+    for state in QUEUE_STATES:
+        if issue_id in queue[state] and state != new_state:
+            queue[state] = [x for x in queue[state] if x != issue_id]
+    if new_state in QUEUE_STATES and issue_id not in queue[new_state]:
+        queue[new_state].append(issue_id)
+    _save_queue(queue, target=target)
+
+
+def cmd_approve(args: argparse.Namespace) -> int:
+    tasks = _load_tasks(args.target)
+    issue_id = args.issue_id
+    current = tasks.get(issue_id, {}).get("status", "draft")
+    ok, reason = validate_transition(current, "approved")
+    if not ok:
+        print(f"cannot approve {issue_id}: {reason}", file=sys.stderr)
+        return 2
+    _set_issue_state(issue_id, "approved", target=args.target)
+    _append_approval(issue_id, "approve", args.user or os.environ.get("USER", "unknown"),
+                     target=args.target)
+    print(f"approved {issue_id}: {current} -> approved")
+    return 0
+
+
+def cmd_transition(args: argparse.Namespace) -> int:
+    tasks = _load_tasks(args.target)
+    issue_id = args.issue_id
+    current = tasks.get(issue_id, {}).get("status", "draft")
+    ok, reason = validate_transition(current, args.new_state)
+    if not ok:
+        print(f"invalid transition: {reason}", file=sys.stderr)
+        return 2
+    _set_issue_state(issue_id, args.new_state, target=args.target)
+    print(f"transitioned {issue_id}: {current} -> {args.new_state}")
+    return 0
+
+
+def cmd_run_start(args: argparse.Namespace) -> int:
+    issue_id = args.issue_id
+    tasks = _load_tasks(args.target)
+    current = tasks.get(issue_id, {}).get("status")
+    if current not in {"approved", "pm-review", "ready-for-dev", "needs-fix"}:
+        print(f"cannot start run for {issue_id} in state {current}", file=sys.stderr)
+        return 2
+    ok, reason = acquire_lock(issue_id, target=args.target)
+    if not ok:
+        print(f"lock failed for {issue_id}: {reason}", file=sys.stderr)
+        return 3
+    run_id = hashlib.sha1(f"{issue_id}-{time.time()}".encode("utf-8")).hexdigest()[:12]
+    run = {
+        "run_id": run_id,
+        "issue_id": _redact_evidence(issue_id),
+        "started_at": time.time(),
+        "ended_at": None,
+        "outcome": None,
+        "agent": args.agent or "dev",
+        "attempt": args.attempt or 1,
+        "evidence": [],
+    }
+    _atomic_write_json(os.path.join(_runs_dir(args.target), f"{run_id}.json"), run)
+    _set_issue_state(issue_id, "in-progress", target=args.target, run_id=run_id,
+                     attempt=args.attempt or 1)
+    print(f"run-start {run_id} for {issue_id}")
+    return 0
+
+
+def cmd_run_end(args: argparse.Namespace) -> int:
+    run_path = os.path.join(_runs_dir(args.target), f"{args.run_id}.json")
+    run = _read_json(run_path, default=None)
+    if not run:
+        print(f"run not found: {args.run_id}", file=sys.stderr)
+        return 1
+    run["ended_at"] = time.time()
+    run["outcome"] = args.outcome or "completed"
+    if args.evidence:
+        run.setdefault("evidence", []).append(_redact_evidence(args.evidence))
+    _atomic_write_json(run_path, run)
+    issue_id = run.get("issue_id") or ""
+    # Release lock
+    if issue_id:
+        release_lock(issue_id, target=args.target)
+    print(f"run-end {args.run_id}: outcome={run['outcome']}")
+    return 0
+
+
+def cmd_lock(args: argparse.Namespace) -> int:
+    ok, reason = acquire_lock(args.issue_id, target=args.target)
+    print(f"lock {args.issue_id}: {'ok' if ok else 'failed'} ({reason})")
+    return 0 if ok else 3
+
+
+def cmd_unlock(args: argparse.Namespace) -> int:
+    ok, reason = release_lock(args.issue_id, target=args.target)
+    print(f"unlock {args.issue_id}: {reason}")
+    return 0
+
+
+# --- selftest -------------------------------------------------------------------
+
+def selftest() -> int:
+    import tempfile
+    failures: List[str] = []
+    tmp = tempfile.mkdtemp(prefix="laplace-selftest-")
+    # Silence stdout noise from init/approve/etc. so selftest output is clean.
+    saved_stdout = sys.stdout
+    sys.stdout = open(os.devnull, "w")
+    try:
+        # 1. init creates expected tree, and only writes under .harness/.
+        before = set(os.listdir(tmp))
+        rc = cmd_init(target=tmp)
+        if rc != 0:
+            failures.append(f"init returned {rc}")
+        after = set(os.listdir(tmp))
+        new_entries = after - before
+        if new_entries != {".harness"}:
+            failures.append(f"init created entries outside .harness/: {new_entries}")
+        for rel in ["config.yml", "routing-rules.yml", "agent-policy.yml", ".gitignore",
+                    "issues", "state/tasks.json", "state/queue.json", "state/approvals.jsonl",
+                    "state/runs", "state/locks", "memory/project.md", "logs",
+                    "artifacts/patches"]:
+            p = os.path.join(tmp, ".harness", rel)
+            if not os.path.exists(p):
+                failures.append(f"init missing {rel}")
+
+        # 2. atomic write round-trip
+        path = os.path.join(tmp, ".harness", "state", "rt.json")
+        _atomic_write_json(path, {"x": 1, "nested": {"y": [1, 2]}})
+        back = _read_json(path)
+        if back != {"x": 1, "nested": {"y": [1, 2]}}:
+            failures.append(f"atomic round-trip mismatch: {back}")
+        if os.path.exists(path + ".tmp"):
+            failures.append("tmp file left behind after atomic write")
+
+        # 3. lock acquire + release + stale reuse
+        ok, _ = acquire_lock("ISSUE-LOCK", target=tmp)
+        if not ok:
+            failures.append("lock acquire failed")
+        ok2, _ = acquire_lock("ISSUE-LOCK", target=tmp)
+        if ok2:
+            failures.append("double-acquire should fail")
+        ok3, _ = release_lock("ISSUE-LOCK", target=tmp)
+        if not ok3:
+            failures.append("release failed")
+        ok4, _ = acquire_lock("ISSUE-LOCK", target=tmp)
+        if not ok4:
+            failures.append("re-acquire after release failed")
+        release_lock("ISSUE-LOCK", target=tmp)  # cleanup for later steps
+
+        # 4. state machine: reject invalid transition
+        v, _ = validate_transition("draft", "approved")
+        if not v:
+            failures.append("draft->approved should be valid")
+        v, _ = validate_transition("draft", "in-progress")
+        if v:
+            failures.append("draft->in-progress should be invalid")
+        v, _ = validate_transition("review", "security-review")
+        if not v:
+            failures.append("review->security-review should be valid")
+
+        # 5. approve writes approval + transitions state
+        # Seed a draft issue into tasks/queue.
+        _save_tasks({"ISSUE-0001": {"status": "draft", "updated_at": time.time()}}, target=tmp)
+        q = _load_queue(target=tmp)
+        q["draft"].append("ISSUE-0001")
+        _save_queue(q, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-0001", user="tester", target=tmp)
+        rc = cmd_approve(ns)
+        if rc != 0:
+            failures.append(f"approve returned {rc}")
+        tasks = _load_tasks(target=tmp)
+        if tasks.get("ISSUE-0001", {}).get("status") != "approved":
+            failures.append(f"approve did not transition: {tasks}")
+        with open(_approvals_path(target=tmp), "r", encoding="utf-8") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        if not lines:
+            failures.append("no approval recorded")
+
+        # 6. run-start / run-end round trip
+        ns = argparse.Namespace(issue_id="ISSUE-0001", agent="dev", attempt=1, target=tmp)
+        rc = cmd_run_start(ns)
+        if rc != 0:
+            failures.append(f"run-start returned {rc}")
+        run_files = [f for f in os.listdir(_runs_dir(target=tmp)) if f.endswith(".json")]
+        if len(run_files) != 1:
+            failures.append(f"expected 1 run file, got {run_files}")
+        rid = run_files[0][:-len(".json")] if run_files else ""
+        ns_end = argparse.Namespace(run_id=rid, outcome="review-passed",
+                                     evidence="tests: 12/12 passed", target=tmp)
+        rc = cmd_run_end(ns_end)
+        if rc != 0:
+            failures.append(f"run-end returned {rc}")
+        run = _read_json(os.path.join(_runs_dir(target=tmp), f"{rid}.json"))
+        if not run or run.get("outcome") != "review-passed":
+            failures.append(f"run outcome not recorded: {run}")
+        if run and not run.get("evidence"):
+            failures.append("evidence not recorded on run-end")
+
+        # 7. redaction is applied to persisted evidence (G-LP-003)
+        ns_ev = argparse.Namespace(run_id=rid, outcome="blocked",
+                                    evidence="Authorization: Bearer " + "a" * 24, target=tmp)
+        rc = cmd_run_end(ns_ev)
+        if rc != 0:
+            failures.append(f"run-end(ev) returned {rc}")
+        run = _read_json(os.path.join(_runs_dir(target=tmp), f"{rid}.json"))
+        if "a" * 24 in json.dumps(run):
+            failures.append("evidence not redacted in run log")
+
+        # 8. config.yml contains all G-LP-004 limits
+        with open(os.path.join(tmp, ".harness", "config.yml"), "r", encoding="utf-8") as f:
+            cfg_text = f.read()
+        for limit in ["max_fix_attempts", "max_pm_clarification_attempts",
+                      "max_security_fix_attempts", "max_runtime_minutes_per_issue",
+                      "max_files_changed_without_approval", "max_diff_lines_without_approval",
+                      "max_stop_hook_iterations"]:
+            if limit not in cfg_text:
+                failures.append(f"config.yml missing {limit}")
+    finally:
+        sys.stdout.close()
+        sys.stdout = saved_stdout
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if failures:
+        for f in failures:
+            print(f"FAIL: {f}", file=sys.stderr)
+        return 1
+    print("state selftest: PASS")
+    return 0
+
+
+def _add_target_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--target", default=None,
+                   help="Repository root containing .harness/ (default: CWD)")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="state.py", description="Laplace state engine")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="Create the .harness/ tree")
+    _add_target_arg(p)
+    p.set_defaults(func=lambda a: cmd_init(a.target))
+
+    p = sub.add_parser("status", help="Print harness status")
+    _add_target_arg(p)
+    p.set_defaults(func=lambda a: cmd_status(a.target))
+
+    p = sub.add_parser("list", help="List issues")
+    _add_target_arg(p)
+    p.add_argument("--status", default=None, help="Filter by state")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("show", help="Show an issue file")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("approve", help="Transition draft -> approved")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.add_argument("--user", default=None)
+    p.set_defaults(func=cmd_approve)
+
+    p = sub.add_parser("transition", help="Generic state-machine transition")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.add_argument("new_state")
+    p.set_defaults(func=cmd_transition)
+
+    p = sub.add_parser("run-start", help="Start a run")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.add_argument("--agent", default=None)
+    p.add_argument("--attempt", type=int, default=None)
+    p.set_defaults(func=cmd_run_start)
+
+    p = sub.add_parser("run-end", help="End a run")
+    _add_target_arg(p)
+    p.add_argument("run_id")
+    p.add_argument("--outcome", default=None)
+    p.add_argument("--evidence", default=None)
+    p.set_defaults(func=cmd_run_end)
+
+    p = sub.add_parser("lock", help="Acquire issue lock")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.set_defaults(func=cmd_lock)
+
+    p = sub.add_parser("unlock", help="Release issue lock")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.set_defaults(func=cmd_unlock)
+
+    p = sub.add_parser("selftest", help="Internal sanity checks")
+    p.set_defaults(func=lambda a: selftest())
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
