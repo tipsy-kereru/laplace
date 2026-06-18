@@ -29,6 +29,10 @@ MAX_RUNTIME_MINUTES_PER_ISSUE = 60
 MAX_FILES_CHANGED_WITHOUT_APPROVAL = 20
 MAX_DIFF_LINES_WITHOUT_APPROVAL = 1000
 MAX_STOP_HOOK_ITERATIONS = 12
+MAX_QUEUE_RUN = 5
+
+DEFAULT_MERGE_POLICY = "wait-for-human-merge"
+VALID_MERGE_POLICIES = {"wait-for-human-merge", "auto-merge-branch"}
 
 LOCK_TTL_SECONDS = 60 * 60  # stale-lock detection window (60 min default)
 
@@ -261,6 +265,7 @@ limits:
   max_files_changed_without_approval: %d
   max_diff_lines_without_approval: %d
   max_stop_hook_iterations: %d
+  max_queue_run: %d
 policy:
   require_approval_for:
     - git_push
@@ -271,6 +276,7 @@ policy:
     - auth_permission_change
     - data_access_change
     - workflow_script_release_change
+  merge_policy: %s
 redaction:
   enabled: true
   store_raw_command_output: false
@@ -282,6 +288,8 @@ redaction:
     MAX_FILES_CHANGED_WITHOUT_APPROVAL,
     MAX_DIFF_LINES_WITHOUT_APPROVAL,
     MAX_STOP_HOOK_ITERATIONS,
+    MAX_QUEUE_RUN,
+    DEFAULT_MERGE_POLICY,
 )
 
 ROUTING_RULES_TEMPLATE = """\
@@ -419,6 +427,95 @@ def cmd_init(target: Optional[str] = None) -> int:
         print("Moon Cell profile detected. Snapshot will be populated by profile.py (P6).")
     print("Next: /laplace:doctor")
     return 0
+
+
+# --- Config loading + validation (G-LP-004, queue runner config) ---------------
+
+def _parse_config_block(text: str, block: str) -> Dict[str, str]:
+    """Minimal hand-parser: extract top-level ``key: value`` lines under the
+    given ``block:`` header (e.g. "limits:" or "policy:"). Returns a dict of
+    key -> raw value string. stdlib only; no yaml dependency.
+
+    Notes:
+      - Only flat scalar keys are supported. Nested blocks (e.g. the
+        ``require_approval_for:`` list under ``policy:``) are skipped by
+        detecting further indentation.
+      - Lines beginning with ``#`` and blank lines are ignored.
+    """
+    out: Dict[str, str] = {}
+    lines = text.splitlines()
+    in_block = False
+    block_indent: Optional[int] = None
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        stripped = raw.strip()
+        if not raw.startswith(" "):
+            # Top-level key. Enter block if it matches our target header.
+            in_block = stripped == f"{block}:" or stripped.startswith(f"{block}:")
+            block_indent = None
+            continue
+        if not in_block:
+            continue
+        if block_indent is None:
+            block_indent = indent
+        # Once we know the block's child indent, only consume lines at that
+        # indent. Deeper-indented lines (nested lists/sub-blocks) are skipped.
+        if indent != block_indent:
+            continue
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def load_config(target: Optional[str] = None) -> Dict[str, Any]:
+    """Read ``<target>/.harness/config.yml`` (target defaults to CWD), parse the
+    flat ``limits:`` and ``policy:`` blocks, apply defaults for missing keys,
+    and validate values. Returns a dict.
+
+    Exits with code 2 on validation failure (invalid merge_policy or
+    non-positive max_queue_run).
+    """
+    path = os.path.join(_harness_root(target), ".harness", "config.yml")
+    if not os.path.exists(path):
+        print(f"config.yml not found: {path}", file=sys.stderr)
+        sys.exit(2)
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    limits = _parse_config_block(text, "limits")
+    policy = _parse_config_block(text, "policy")
+
+    # max_queue_run: int, default 5, must be positive.
+    raw_queue_run = limits.get("max_queue_run")
+    if raw_queue_run is None or raw_queue_run == "":
+        max_queue_run = MAX_QUEUE_RUN
+    else:
+        try:
+            max_queue_run = int(raw_queue_run)
+        except ValueError:
+            print(f"invalid max_queue_run (not an int): {raw_queue_run!r}",
+                  file=sys.stderr)
+            sys.exit(2)
+        if max_queue_run <= 0:
+            print(f"invalid max_queue_run (must be positive int): {max_queue_run}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    # merge_policy: enum, default wait-for-human-merge.
+    merge_policy = policy.get("merge_policy") or DEFAULT_MERGE_POLICY
+    if merge_policy not in VALID_MERGE_POLICIES:
+        print(f"invalid merge_policy: {merge_policy!r} "
+              f"(valid: {sorted(VALID_MERGE_POLICIES)})", file=sys.stderr)
+        sys.exit(2)
+
+    return {
+        "max_queue_run": max_queue_run,
+        "merge_policy": merge_policy,
+    }
 
 
 def _format_status(target: Optional[str] = None) -> str:
@@ -724,7 +821,7 @@ def selftest() -> int:
         for limit in ["max_fix_attempts", "max_pm_clarification_attempts",
                       "max_security_fix_attempts", "max_runtime_minutes_per_issue",
                       "max_files_changed_without_approval", "max_diff_lines_without_approval",
-                      "max_stop_hook_iterations"]:
+                      "max_stop_hook_iterations", "max_queue_run", "merge_policy"]:
             if limit not in cfg_text:
                 failures.append(f"config.yml missing {limit}")
     finally:
