@@ -11,6 +11,7 @@ intra-issue phase loop using runner primitives (compose, not re-implement).
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -83,12 +84,156 @@ def _log(tmp, run_id):
 
 
 # ---------------------------------------------------------------------------
-# Stub
+# Merge policy (ISSUE-0004: wait-for-human-merge)
 # ---------------------------------------------------------------------------
 
-def test_handle_merge_policy_stub_returns_halt():
+def test_handle_merge_policy_empty_issue_returns_halt():
+    assert queue_runner._handle_merge_policy("", None) == "halt"
+
+
+def test_handle_merge_policy_non_repo_returns_halt():
+    # A plain temp dir with no .git is fail-safe -> halt.
+    tmp = tempfile.mkdtemp(prefix="laplace-mp-nonrepo-")
+    try:
+        assert queue_runner._handle_merge_policy("ISSUE-X", tmp) == "halt"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # None target -> resolves to CWD which is not the issue branch's repo;
+    # fail-safe -> halt without raising.
     assert queue_runner._handle_merge_policy("ISSUE-X", None) == "halt"
-    assert queue_runner._handle_merge_policy("ISSUE-X", "/tmp") == "halt"
+
+
+def _git(args, cwd):
+    r = subprocess.run(["git", "-C", cwd] + args,
+                       capture_output=True, text=True, timeout=10)
+    assert r.returncode == 0, f"git {args} in {cwd} failed: {r.stderr}"
+    return r
+
+
+def _make_repo(base_branch):
+    repo = tempfile.mkdtemp(prefix="laplace-mp-repo-")
+    _git(["init", "-q", f"--initial-branch={base_branch}"], repo)
+    _git(["config", "user.email", "unit@test"], repo)
+    _git(["config", "user.name", "unit"], repo)
+    with open(os.path.join(repo, "README.md"), "w") as f:
+        f.write("init\n")
+    _git(["add", "README.md"], repo)
+    _git(["commit", "-q", "-m", "init"], repo)
+    return repo
+
+
+def test_issue_branch_is_merged_true_on_main():
+    repo = _make_repo("main")
+    try:
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-M"], repo)
+        with open(os.path.join(repo, "f.txt"), "w") as f:
+            f.write("change\n")
+        _git(["add", "f.txt"], repo)
+        _git(["commit", "-q", "-m", "change"], repo)
+        _git(["checkout", "-q", "main"], repo)
+        _git(["merge", "-q", "--no-ff", "laplace/ISSUE-M", "-m", "merge"], repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-M", repo) is True
+        assert queue_runner._handle_merge_policy("ISSUE-M", repo) == "advance"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_issue_branch_is_merged_false_when_unmerged():
+    repo = _make_repo("main")
+    try:
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-U"], repo)
+        with open(os.path.join(repo, "g.txt"), "w") as f:
+            f.write("change\n")
+        _git(["add", "g.txt"], repo)
+        _git(["commit", "-q", "-m", "change"], repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-U", repo) is False
+        assert queue_runner._handle_merge_policy("ISSUE-U", repo) == "halt"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_issue_branch_is_merged_falls_back_to_master():
+    repo = _make_repo("master")
+    try:
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-MS"], repo)
+        with open(os.path.join(repo, "h.txt"), "w") as f:
+            f.write("change\n")
+        _git(["add", "h.txt"], repo)
+        _git(["commit", "-q", "-m", "change"], repo)
+        _git(["checkout", "-q", "master"], repo)
+        _git(["merge", "-q", "--no-ff", "laplace/ISSUE-MS", "-m", "merge"], repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-MS", repo) is True
+        assert queue_runner._handle_merge_policy("ISSUE-MS", repo) == "advance"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_issue_branch_is_merged_missing_branch_returns_false():
+    repo = _make_repo("main")
+    try:
+        # Branch never created -> not an ancestor.
+        assert queue_runner._issue_branch_is_merged("ISSUE-NOPE", repo) \
+            is False
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_queue_halt_merge_wait_then_resume_advances():
+    """AC-QR-011 + AC-QR-012 in a real git repo.
+
+    First run: ISSUE-A reaches review-passed, its branch (with one commit)
+    is not merged into main -> halt with merge-wait:ISSUE-A. ISSUE-B stays
+    approved. After human merges laplace/ISSUE-A into main: second run skips
+    ISSUE-A (terminal, no longer in approved) and advances to ISSUE-B,
+    which (its branch unmerged) halts merge-wait:ISSUE-B.
+    """
+    repo = _make_repo("main")
+    try:
+        assert state.cmd_init(target=repo) == 0
+        cfg = state.load_config(repo)
+        _seed_approved(repo, "ISSUE-A")
+        _seed_approved(repo, "ISSUE-B")
+
+        def drive_with_commit(issue_id, target):
+            # Add a distinct commit to the issue branch so it is NOT a
+            # trivial ancestor of main (cmd_start only creates the branch).
+            marker = f"{issue_id}.txt"
+            with open(os.path.join(target, marker), "w") as f:
+                f.write(f"{issue_id}\n")
+            _git(["add", marker], target)
+            _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+            _drive_to_review_passed(issue_id, target)
+
+        # First run: ISSUE-A's branch has a commit, not merged -> halt.
+        rid1, rc1 = queue_runner._run_queue(
+            None, repo, cfg, drive_with_commit)
+        assert rc1 == 0
+        log1 = _log(repo, rid1)
+        assert log1["outcome"] == "merge-wait:ISSUE-A", log1["outcome"]
+        assert log1["queue_steps"] == []
+        assert state._load_tasks(repo)["ISSUE-B"]["status"] == "approved"
+        assert queue_runner._issue_branch_is_merged("ISSUE-A", repo) is False
+
+        # Human merges ISSUE-A's branch into main.
+        _git(["checkout", "-q", "main"], repo)
+        _git(["merge", "-q", "--no-ff", "laplace/ISSUE-A", "-m", "merge A"], repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-A", repo) is True
+
+        # Second run: ISSUE-A is review-passed (terminal) and was removed
+        # from `approved` by _set_issue_state, so the queue resumes at
+        # ISSUE-B. No queue_step is recorded in this run (ISSUE-A was not
+        # processed here); the resume is implicit via the approved-list drop.
+        q_after = state._load_queue(repo)
+        assert "ISSUE-A" not in q_after.get("approved", [])
+        assert "ISSUE-B" in q_after.get("approved", [])
+        rid2, rc2 = queue_runner._run_queue(
+            None, repo, cfg, drive_with_commit)
+        assert rc2 == 0
+        log2 = _log(repo, rid2)
+        assert log2["outcome"] == "merge-wait:ISSUE-B", log2["outcome"]
+        assert log2["queue_steps"] == []
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

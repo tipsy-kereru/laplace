@@ -23,18 +23,26 @@ re-implement state transitions, fix-attempt limits, test-evidence gates, or
 security checks -- those live inside runner.py primitives. queue_runner only
 composes them and maps their exit codes to advance/halt decisions.
 
-Merge execution is out of scope for this issue. `_handle_merge_policy` is a
-single stub that always returns "halt"; ISSUE-0004/0005 replace its body.
+Merge execution is out of scope for this issue. `_handle_merge_policy`
+(ISSUE-0004) detects whether the human has merged the issue branch into the
+base branch via `git merge-base --is-ancestor`. When merged, the queue
+advances to the next issue; otherwise it halts with `merge-wait:<id>`.
 
-GATE ROUTING CONTRACT (AC-QR-G2): queue_runner issues no git commands itself
-in this issue -- all git work happens inside runner.py primitives, which
-already route through policy.check_command. If a future change adds a git
-invocation here, it MUST go through policy.check_command first.
+GATE ROUTING CONTRACT (AC-QR-G2): every git command queue_runner issues is
+routed through policy.check_command first. The merge-base probe respects
+that contract; on policy denial the probe fails safe (False -> halt ->
+re-emit merge-wait).
 """
+
+
+# Branch prefix mirrored from runner.BRANCH_PREFIX (kept here to avoid a
+# runtime cross-module constant dependency; the two MUST stay in sync).
+_BRANCH_PREFIX = "laplace"
 
 import argparse
 import hashlib
 import os
+import subprocess
 import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -46,6 +54,7 @@ if HERE not in sys.path:
 # Peer modules imported after the sys.path bootstrap above (mirrors runner.py).
 import state  # noqa: E402
 import runner  # noqa: E402
+import policy  # noqa: E402
 
 # Exit codes mirrored from runner.py for the decision matrix.
 EXIT_OK = 0
@@ -84,19 +93,73 @@ def _read_issue_run_id(issue_id: str, target: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Merge policy stub (AC-QR-007; single override point for ISSUE-0004/0005)
+# Merge policy (AC-QR-007; ISSUE-0004: wait-for-human-merge detection)
 # ---------------------------------------------------------------------------
+
+def _issue_branch_is_merged(issue_id: str, target: Optional[str]) -> bool:
+    """Return True if the issue's branch has been merged into the base branch.
+
+    Fail-safe: any error condition (non-repo, git missing, branch missing,
+    policy denial, timeout, non-zero exit) returns False, which causes the
+    caller to halt and re-emit `merge-wait:<id>` until the human completes
+    the merge.
+
+    Uses `git merge-base --is-ancestor laplace/<issue_id> <base>` to detect
+    ancestry. Base defaults to `main`, falling back to `master` if `main`
+    does not exist.
+
+    GATE ROUTING CONTRACT: the git command is routed through
+    policy.check_command first. On denial, returns False (fail-safe).
+    """
+    if not issue_id:
+        return False
+    safe = issue_id.replace("/", "_")
+    branch = f"{_BRANCH_PREFIX}/{safe}"
+    root = state._harness_root(target)
+
+    # Fail fast if this isn't a git worktree (no .git). Avoids a noisy
+    # subprocess spawn in common non-repo test/dev harnesses.
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return False
+
+    for base in ("main", "master"):
+        cmd = f"git merge-base --is-ancestor {branch} {base}"
+        ok, _reason = policy.check_command(cmd)
+        if not ok:
+            # Policy denied this command; fail safe.
+            return False
+        try:
+            r = subprocess.run(
+                ["git", "-C", root, "merge-base", "--is-ancestor",
+                 branch, base],
+                capture_output=True,
+                timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            # git missing / timed out / OS error -> fail safe.
+            return False
+        if r.returncode == 0:
+            return True
+        # returncode 1 means "not an ancestor" (or base/branch missing).
+        # Either way, try the next base candidate. If this was the last
+        # candidate, fall through to the final False return below.
+
+    return False
+
 
 def _handle_merge_policy(issue_id: str, target: Optional[str]) -> str:
     """Decide advance vs halt after an issue reaches review-passed.
 
-    Stub for ISSUE-0003: always halts (default policy wait-for-human-merge).
-    ISSUE-0004 replaces body to detect human merge completion.
-    ISSUE-0005 replaces body to perform auto-merge-branch.
+    ISSUE-0004 (wait-for-human-merge): advances only when the issue's branch
+    has been merged into the base branch (main, falling back to master).
+    Otherwise halts so the run-queue is re-invoked after the human merges.
+
     Returns one of {"advance", "halt"}.
     """
-    # issue_id/target accepted for signature stability across ISSUE-0004/0005.
-    _ = (issue_id, target)
+    if not issue_id:
+        return "halt"
+    if _issue_branch_is_merged(issue_id, target):
+        return "advance"
     return "halt"
 
 
@@ -270,12 +333,14 @@ def _decide(result: IssueResult, next_issue: Optional[str],
         return True, f"terminal:{final}"
 
     # final == review-passed: consult merge policy + deps + counter.
+    # _handle_merge_policy takes an issue id (the branch name is derived
+    # from it); recover the issue id from the child run log.
+    issue_id = _issue_from_run(result, target)
     if policy_override is not None:
-        decision = policy_override(result.child_run_id or "", target)
+        decision = policy_override(issue_id, target)
     else:
-        decision = _handle_merge_policy(result.child_run_id or "", target)
+        decision = _handle_merge_policy(issue_id, target)
     if decision == "halt":
-        issue_id = _issue_from_run(result, target)
         return True, f"merge-wait:{issue_id}"
 
     # decision == "advance"
@@ -428,9 +493,95 @@ def selftest() -> int:
     sys.stdout = open(os.devnull, "w")
     sys.stderr = open(os.devnull, "w")
     try:
-        # --- _handle_merge_policy stub returns "halt" --------------------
+        # --- _handle_merge_policy: wait-for-human-merge detection --------
+        # Empty issue id -> halt (defensive).
+        if _handle_merge_policy("", tmp) != "halt":
+            failures.append("_handle_merge_policy('') should return 'halt'")
+        # Non-repo tmp target -> halt, no subprocess crash (fail-safe).
         if _handle_merge_policy("ISSUE-X", tmp) != "halt":
-            failures.append("_handle_merge_policy stub should return 'halt'")
+            failures.append(
+                "_handle_merge_policy non-repo should return 'halt'")
+        if _handle_merge_policy("ISSUE-X", None) != "halt":
+            failures.append(
+                "_handle_merge_policy non-repo (None target) should 'halt'")
+
+        # Real git repo: merged branch -> advance; unmerged -> halt.
+        def _git(args, cwd):
+            r = subprocess.run(["git", "-C", cwd] + args,
+                               capture_output=True, text=True, timeout=10)
+            assert r.returncode == 0, \
+                f"git {args} failed in {cwd}: {r.stderr}"
+            return r
+
+        def _make_repo(base_branch: str) -> str:
+            """Create a temp git repo with the given default base branch."""
+            repo = tempfile.mkdtemp(prefix="laplace-queue-git-")
+            _git(["init", "-q", f"--initial-branch={base_branch}"], repo)
+            _git(["config", "user.email", "self@test"], repo)
+            _git(["config", "user.name", "selftest"], repo)
+            # initial commit on base branch
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("init\n")
+            _git(["add", "README.md"], repo)
+            _git(["commit", "-q", "-m", "init"], repo)
+            return repo
+
+        # merged branch on `main` -> advance
+        repo_main = _make_repo("main")
+        try:
+            _git(["checkout", "-q", "-b", "laplace/ISSUE-M"], repo_main)
+            with open(os.path.join(repo_main, "f.txt"), "w") as f:
+                f.write("change\n")
+            _git(["add", "f.txt"], repo_main)
+            _git(["commit", "-q", "-m", "issue change"], repo_main)
+            _git(["checkout", "-q", "main"], repo_main)
+            _git(["merge", "-q", "--no-ff", "laplace/ISSUE-M",
+                  "-m", "merge issue"], repo_main)
+            if _handle_merge_policy("ISSUE-M", repo_main) != "advance":
+                failures.append(
+                    "merged branch on main should return 'advance'")
+            # _issue_branch_is_merged direct check
+            if not _issue_branch_is_merged("ISSUE-M", repo_main):
+                failures.append(
+                    "_issue_branch_is_merged should be True for merged branch")
+        finally:
+            shutil.rmtree(repo_main, ignore_errors=True)
+
+        # unmerged branch on `main` -> halt
+        repo_unmerged = _make_repo("main")
+        try:
+            _git(["checkout", "-q", "-b", "laplace/ISSUE-U"],
+                 repo_unmerged)
+            with open(os.path.join(repo_unmerged, "g.txt"), "w") as f:
+                f.write("change\n")
+            _git(["add", "g.txt"], repo_unmerged)
+            _git(["commit", "-q", "-m", "issue change"], repo_unmerged)
+            if _handle_merge_policy("ISSUE-U", repo_unmerged) != "halt":
+                failures.append(
+                    "unmerged branch should return 'halt'")
+            if _issue_branch_is_merged("ISSUE-U", repo_unmerged):
+                failures.append(
+                    "_issue_branch_is_merged should be False for unmerged")
+        finally:
+            shutil.rmtree(repo_unmerged, ignore_errors=True)
+
+        # merged branch on `master` (no `main`) -> advance via fallback
+        repo_master = _make_repo("master")
+        try:
+            _git(["checkout", "-q", "-b", "laplace/ISSUE-MS"],
+                 repo_master)
+            with open(os.path.join(repo_master, "h.txt"), "w") as f:
+                f.write("change\n")
+            _git(["add", "h.txt"], repo_master)
+            _git(["commit", "-q", "-m", "issue change"], repo_master)
+            _git(["checkout", "-q", "master"], repo_master)
+            _git(["merge", "-q", "--no-ff", "laplace/ISSUE-MS",
+                  "-m", "merge issue"], repo_master)
+            if _handle_merge_policy("ISSUE-MS", repo_master) != "advance":
+                failures.append(
+                    "merged branch on master should return 'advance'")
+        finally:
+            shutil.rmtree(repo_master, ignore_errors=True)
 
         def _advance_policy(issue_id, target):  # noqa: ARG001
             return "advance"
@@ -499,8 +650,9 @@ def selftest() -> int:
                 )
                 assert runner.cmd_advance(ns) == 0
 
-        # --- AC-QR-007 + AC-QR-009: review-passed with stub (halt) -------
-        # Two-issue queue; default policy halts on merge-wait after ISSUE-A.
+        # --- AC-QR-007 + AC-QR-011: review-passed, non-repo -> merge-wait -
+        # tmp is not a git repo, so _issue_branch_is_merged fails safe to
+        # False, and the default policy halts with merge-wait:ISSUE-A.
         state._save_tasks({}, target=tmp)
         state._save_queue(state.DEFAULT_QUEUE, target=tmp)
         seed_approved("ISSUE-A")
@@ -515,14 +667,14 @@ def selftest() -> int:
         if log1.get("outcome") != "merge-wait:ISSUE-A":
             failures.append(
                 f"expected merge-wait:ISSUE-A, got {log1.get('outcome')}")
-        # ISSUE-B must NOT have been started (stub halts).
+        # ISSUE-B must NOT have been started (merge-wait halts).
         if _read_issue_status("ISSUE-B", tmp) != "approved":
             failures.append(
-                "ISSUE-B should remain approved when stub halts")
+                "ISSUE-B should remain approved when merge-wait halts")
         # queue_steps should be empty (no advance happened).
         if log1.get("queue_steps"):
             failures.append(
-                f"queue_steps should be empty on stub halt, got "
+                f"queue_steps should be empty on merge-wait halt, got "
                 f"{log1.get('queue_steps')}")
         # issues trail should contain ISSUE-A's child run.
         if not log1.get("issues"):
@@ -641,6 +793,32 @@ def selftest() -> int:
                 failures.append(
                     f"queue_step evidence_run_id {s.get('evidence_run_id')} "
                     f"!= ISSUE-P1 run {p1_run}")
+
+        # --- AC-QR-012: resume mechanism (review-passed leaves approved) --
+        # After a merge-wait halt, the completed issue is at review-passed
+        # (a terminal state) and thus absent from `approved` on the next
+        # _run_queue call. The queue naturally resumes at the next issue
+        # without an explicit pop -- characterize this implicit resume.
+        state._save_tasks({}, target=tmp)
+        state._save_queue(state.DEFAULT_QUEUE, target=tmp)
+        seed_approved("ISSUE-R1")
+        seed_approved("ISSUE-R2")
+        ridR, rcR = _run_queue(None, tmp, cfg, drive_to_review_passed)
+        logR = state._read_json(_queue_run_log_path(ridR, tmp), default=None)
+        if not logR or logR.get("outcome") != "merge-wait:ISSUE-R1":
+            failures.append(
+                f"resume char: expected merge-wait:ISSUE-R1, got "
+                f"{logR.get('outcome') if logR else None}")
+        q_after = state._load_queue(tmp)
+        if _read_issue_status("ISSUE-R1", tmp) != "review-passed":
+            failures.append(
+                "resume char: ISSUE-R1 should be review-passed")
+        if "ISSUE-R1" in q_after.get("approved", []):
+            failures.append(
+                "resume char: ISSUE-R1 should be absent from approved queue")
+        if "ISSUE-R2" not in q_after.get("approved", []):
+            failures.append(
+                "resume char: ISSUE-R2 should still be in approved queue")
 
         # --- Characterization: runner primitives unaffected --------------
         # Direct runner.cmd_start + cmd_end still works (no queue_runner).
