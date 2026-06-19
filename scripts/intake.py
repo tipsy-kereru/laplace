@@ -159,6 +159,35 @@ def _extract_scope(body: str) -> Tuple[str, str]:
     return "; ".join(in_scope), "; ".join(out_scope)
 
 
+def _extract_depends_on(body: str) -> List[str]:
+    """Parse a `Depends on:` line into a list of ISSUE-NNNN ids.
+
+    Matches the first `^Depends on:\\s*(.+)$` line (multiline, case-insensitive).
+    Splits the RHS on commas and/or whitespace; each token must match
+    `^ISSUE-\\d{4}$`. Invalid tokens are dropped. Returns `[]` when absent
+    or when no valid tokens remain.
+    """
+    m = re.search(r"(?im)^Depends on:\s*(.+)$", body)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    if not raw:
+        return []
+    tokens = re.split(r"[,\s]+", raw)
+    out: List[str] = []
+    seen = set()
+    for tok in tokens:
+        if not tok:
+            continue
+        if not re.match(r"^ISSUE-\d{4}$", tok):
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
 def _extract_acceptance(body: str) -> List[str]:
     ac_head = re.compile(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:Acceptance Criteria|AC|Acceptance)\s*:?\s*$"
@@ -223,6 +252,9 @@ def _render_issue(issue: Dict[str, Any]) -> str:
         "",
         "## Background",
         issue["background"],
+        "",
+        "## Dependencies",
+        f"- depends_on: {', '.join(issue['depends_on']) if issue['depends_on'] else '(none)'}",
         "",
         "## Scope",
         "**In Scope:**",
@@ -318,6 +350,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
             ac = [state._redact_evidence(a) for a in _extract_acceptance(body)]
             summary = r_title or "TBD"
             background = state._redact_evidence(_extract_background(body))
+            deps = _extract_depends_on(body)
             issue_type = _infer_type(title, body)
             area = state._redact_evidence(_infer_area(title))
             # Relative path keeps Source portable across machines.
@@ -336,6 +369,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
                 "background": background or "TBD",
                 "scope": {"in_scope": in_scope, "out_scope": out_scope},
                 "acceptance_criteria": ac,
+                "depends_on": deps,
                 "technical_notes": "TBD",
                 "test_requirements": {
                     "unit": "TBD", "integration": "TBD", "e2e": "TBD",
@@ -369,6 +403,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
                 "updated_at": time.time(),
                 "created_at": time.time(),
                 "source": rel_doc,
+                "depends_on": deps,
             }
             if issue_id not in queue["draft"]:
                 queue["draft"].append(issue_id)
@@ -434,6 +469,7 @@ def selftest() -> int:
             "Intro paragraph that spans the whole product.\n\n"
             "## Feature: User Login\n\n"
             "Users need to log in via OAuth. This is core to onboarding.\n\n"
+            "Depends on: ISSUE-0001\n\n"
             "In Scope:\n"
             "- Login page\n"
             "- Token refresh\n\n"
@@ -524,6 +560,22 @@ def selftest() -> int:
             failures.append("ISSUE-0001 Acceptance Criteria not extracted")
         if "return 401" not in c1:
             failures.append("ISSUE-0001 Acceptance Criteria 401 missing")
+
+        # --- depends_on parsing --------------------------------------------
+        if "## Dependencies" not in c1:
+            failures.append("ISSUE-0001 missing Dependencies section")
+        if "depends_on: ISSUE-0001" not in c1:
+            failures.append("ISSUE-0001 depends_on not rendered in .md")
+        if tasks.get("ISSUE-0001", {}).get("depends_on") != ["ISSUE-0001"]:
+            failures.append(f"ISSUE-0001 depends_on not in tasks.json: {tasks.get('ISSUE-0001')}")
+        # Other issues should render (none) and have empty lists.
+        for cid, path in [("ISSUE-0002", issue_files[1]), ("ISSUE-0003", issue_files[2])]:
+            with open(path, "r", encoding="utf-8") as f:
+                cc = f.read()
+            if "depends_on: (none)" not in cc:
+                failures.append(f"{cid} should render empty depends_on as (none)")
+            if tasks.get(cid, {}).get("depends_on") != []:
+                failures.append(f"{cid} tasks.json depends_on should be empty list")
 
         # --- Redaction of Source field -------------------------------------
         # The fake token must NOT appear in any persisted issue file.
