@@ -224,6 +224,37 @@ Resolve the source document or the issue metadata, then re-run:
 
 ---
 
+## Use case 6 — Queue run: multiple approved issues
+
+Scenario: three issues are approved and you want them run back-to-back without babysitting each one.
+
+```
+/laplace:approve ISSUE-0005
+/laplace:approve ISSUE-0006
+/laplace:approve ISSUE-0007
+/laplace:run-queue
+```
+
+The queue runner picks the head of the approved queue, runs the full loop for that issue via `/laplace:run`, and on `review-passed` advances to the next approved issue. With the default `wait-for-human-merge` policy it halts at the first merge gate:
+
+```
+Queue halted: merge-wait:ISSUE-0005
+queue-run-id: q-7f3a...
+queue_steps:
+  - ISSUE-0005: review-passed (awaiting human merge)
+Next: Merge branch laplace/ISSUE-0005 into base, then re-run /laplace:run-queue
+```
+
+Merge the branch into base, then resume the queue:
+
+```
+/laplace:run-queue
+```
+
+The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue-exhausted` when the approved queue is empty. If you hit a `blocked:<id>` or `human-approval-required:<id>`, resolve it via the normal exception flow and re-run `/laplace:run-queue` to continue with the remaining queue.
+
+---
+
 ## Command reference (quick)
 
 | Command | When |
@@ -233,6 +264,7 @@ Resolve the source document or the issue metadata, then re-run:
 | `/laplace:intake <prd>` | Have a PRD/story ready to convert |
 | `/laplace:approve <issue>` | You reviewed a draft and want it in the queue |
 | `/laplace:run [issue]` | Execute or resume a loop |
+| `/laplace:run-queue [issue]` | Multiple issues approved, want them run in order |
 | `/laplace:status` | Check queue, active run, blockers |
 | `/laplace:report <issue>` | Review sanitized evidence and verdicts |
 | `/laplace:cancel [issue]` | Stop a loop safely (keeps state) |
