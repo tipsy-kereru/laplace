@@ -193,6 +193,75 @@ def validate_transition(from_state: str, to_state: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _check_dependency_graph(issue_id: str,
+                            target: Optional[str] = None) -> Tuple[bool, str]:
+    """Validate the dependency graph for an issue on approval.
+
+    Builds an id -> deps map from tasks.json (each record's `depends_on` list;
+    missing key treated as empty). Two checks:
+      1. Missing reference: every dep must exist as a key in tasks.json.
+      2. Cycle detection: DFS from `issue_id` over the deps map; a cycle
+         (including a length-1 self-reference) is rejected.
+
+    Returns (True, "ok") when valid, else (False, "<human-readable reason>").
+    """
+    tasks = _load_tasks(target)
+    graph: Dict[str, List[str]] = {
+        tid: list(rec.get("depends_on", []) or []) for tid, rec in tasks.items()
+    }
+    deps = graph.get(issue_id, [])
+    # 1. Missing reference check.
+    for dep in deps:
+        if dep not in graph:
+            return False, f"cannot approve {issue_id}: dependency {dep} does not exist"
+    # 2. Cycle detection (DFS over the whole graph reachable from issue_id).
+    WHITE, GREY, BLACK = 0, 1, 2
+    color: Dict[str, int] = {}
+
+    def dfs(node: str) -> Optional[str]:
+        color[node] = GREY
+        for nxt in graph.get(node, []):
+            if nxt not in graph:
+                # Missing ref reachable transitively; report it too.
+                return f"dependency {nxt} of {node} does not exist"
+            c = color.get(nxt, WHITE)
+            if c == GREY:
+                return f"cycle detected: {node} -> {nxt}"
+            if c == WHITE:
+                cyc = dfs(nxt)
+                if cyc is not None:
+                    return cyc
+        color[node] = BLACK
+        return None
+
+    cyc = dfs(issue_id)
+    if cyc is not None:
+        return False, f"cannot approve {issue_id}: {cyc}"
+    return True, "ok"
+
+
+def _dependencies_satisfied(issue_id: str,
+                            target: Optional[str] = None) -> Tuple[bool, str]:
+    """Check whether every declared dependency of `issue_id` is satisfied.
+
+    A dependency is considered satisfied when its state is `review-passed`
+    or any terminal state (TERMINAL_STATES). Returns (True, "ok") when all
+    deps are satisfied, else (False, "unmet dependency: <id> (<state>)").
+
+    NOTE: This is a stub helper. The queue runner (ISSUE-0003) will call it
+    before starting an issue. `cmd_approve` only enforces graph *validity*
+    (existence + acyclicity) via `_check_dependency_graph`, NOT satisfaction.
+    """
+    tasks = _load_tasks(target)
+    deps = tasks.get(issue_id, {}).get("depends_on", []) or []
+    for dep in deps:
+        dep_state = tasks.get(dep, {}).get("status", "draft")
+        if dep_state == "review-passed" or dep_state in TERMINAL_STATES:
+            continue
+        return False, f"unmet dependency: {dep} (state={dep_state})"
+    return True, "ok"
+
+
 # --- Tasks / queue helpers ------------------------------------------------------
 
 def _tasks_path(target: Optional[str] = None) -> str:
@@ -528,6 +597,10 @@ def cmd_approve(args: argparse.Namespace) -> int:
     if not ok:
         print(f"cannot approve {issue_id}: {reason}", file=sys.stderr)
         return 2
+    ok, reason = _check_dependency_graph(issue_id, target=args.target)
+    if not ok:
+        print(reason, file=sys.stderr)
+        return 2
     _set_issue_state(issue_id, "approved", target=args.target)
     _append_approval(issue_id, "approve", args.user or os.environ.get("USER", "unknown"),
                      target=args.target)
@@ -688,7 +761,74 @@ def selftest() -> int:
         if not lines:
             failures.append("no approval recorded")
 
+        # 5b. dependency graph: missing ref rejected (rc=2)
+        _save_tasks({
+            "ISSUE-0001": {"status": "approved", "updated_at": time.time()},
+            "ISSUE-0100": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-9999"]},
+        }, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-0100", user="tester", target=tmp)
+        rc = cmd_approve(ns)
+        if rc != 2:
+            failures.append(f"approve with missing dep should rc=2, got {rc}")
+
+        # 5c. dependency graph: self-cycle rejected (rc=2)
+        _save_tasks({
+            "ISSUE-0001": {"status": "approved", "updated_at": time.time()},
+            "ISSUE-0200": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-0200"]},
+        }, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-0200", user="tester", target=tmp)
+        rc = cmd_approve(ns)
+        if rc != 2:
+            failures.append(f"approve with self-cycle should rc=2, got {rc}")
+
+        # 5d. dependency graph: two-node cycle A->B->A rejected (rc=2)
+        _save_tasks({
+            "ISSUE-0001": {"status": "approved", "updated_at": time.time()},
+            "ISSUE-0300": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-0301"]},
+            "ISSUE-0301": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-0300"]},
+        }, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-0300", user="tester", target=tmp)
+        rc = cmd_approve(ns)
+        if rc != 2:
+            failures.append(f"approve with A->B->A cycle should rc=2, got {rc}")
+
+        # 5e. dependency graph: valid existing deps approve succeeds
+        _save_tasks({
+            "ISSUE-0001": {"status": "review-passed", "updated_at": time.time()},
+            "ISSUE-0400": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-0001"]},
+        }, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-0400", user="tester", target=tmp)
+        rc = cmd_approve(ns)
+        if rc != 0:
+            failures.append(f"approve with valid existing dep should succeed, got {rc}")
+        tasks = _load_tasks(target=tmp)
+        if tasks.get("ISSUE-0400", {}).get("status") != "approved":
+            failures.append("ISSUE-0400 should be approved after valid dep")
+
+        # 5f. _dependencies_satisfied stub semantics
+        ok, _ = _dependencies_satisfied("ISSUE-0400", target=tmp)
+        if not ok:
+            failures.append("_dependencies_satisfied should pass when dep is review-passed")
+        _save_tasks({
+            "ISSUE-0500": {"status": "draft", "updated_at": time.time(),
+                           "depends_on": ["ISSUE-0501"]},
+            "ISSUE-0501": {"status": "in-progress", "updated_at": time.time()},
+        }, target=tmp)
+        ok, reason = _dependencies_satisfied("ISSUE-0500", target=tmp)
+        if ok or "unmet dependency" not in reason:
+            failures.append(f"_dependencies_satisfied should fail on in-progress dep: {reason}")
+
         # 6. run-start / run-end round trip
+        # Reset ISSUE-0001 to approved so run-start accepts it (block 5 left it
+        # in review-passed to exercise the dep-satisfaction stub).
+        _save_tasks({
+            "ISSUE-0001": {"status": "approved", "updated_at": time.time()},
+        }, target=tmp)
         ns = argparse.Namespace(issue_id="ISSUE-0001", agent="dev", attempt=1, target=tmp)
         rc = cmd_run_start(ns)
         if rc != 0:
