@@ -587,6 +587,70 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def _find_resumable_queue_run(target: Optional[str] = None) \
+        -> Optional[Dict[str, Any]]:
+    """Find the most-recent resumable queue run log under .harness/state/runs/.
+
+    A queue run is "resumable" when it is halted on a merge-state outcome
+    (ISSUE-0007): ``outcome`` startswith ``"merge-"`` (merge-wait,
+    merge-conflict, merge-not-a-git-repo, merge-policy-denied). Queue runs are
+    synchronous -- by the time status runs every queue log has ``ended_at``
+    set -- so resumable means "halted but resumable", not "live".
+
+    Scans ``*.json`` logs with ``kind == "queue"`` and returns the most recent
+    by ``started_at`` (falling back to ``ended_at``), or None.
+    """
+    runs_dir = _runs_dir(target)
+    if not os.path.isdir(runs_dir):
+        return None
+    candidates: List[Dict[str, Any]] = []
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = _read_json(os.path.join(runs_dir, name), default=None)
+        if not isinstance(log, dict):
+            continue
+        if log.get("kind") != "queue":
+            continue
+        outcome = log.get("outcome") or ""
+        if not isinstance(outcome, str) or not outcome.startswith("merge-"):
+            continue
+        candidates.append(log)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda l: float(l.get("started_at") or l.get("ended_at") or 0.0),
+        reverse=True)
+    return candidates[0]
+
+
+def _resumable_queue_current_issue(log: Dict[str, Any],
+                                   target: Optional[str] = None) -> str:
+    """Resolve the "current issue" for a resumable queue run log.
+
+    Preference order (ISSUE-0007):
+      1. The outcome token suffix (``merge-wait:ISSUE-A`` -> ``ISSUE-A``).
+      2. The issue_id of the last child run recorded in ``log["issues"]``.
+      3. ``"?"`` fallback.
+    """
+    outcome = log.get("outcome") or ""
+    if isinstance(outcome, str) and ":" in outcome:
+        suffix = outcome.split(":", 1)[1].strip()
+        if suffix:
+            return suffix
+    issues = log.get("issues") or []
+    if issues:
+        last_child = issues[-1]
+        runs_dir = _runs_dir(target)
+        child_log = _read_json(
+            os.path.join(runs_dir, f"{last_child}.json"), default=None)
+        if isinstance(child_log, dict):
+            cid = child_log.get("issue_id")
+            if isinstance(cid, str) and cid:
+                return cid
+    return "?"
+
+
 def _format_status(target: Optional[str] = None) -> str:
     tasks = _load_tasks(target)
     queue = _load_queue(target)
@@ -620,6 +684,22 @@ def _format_status(target: Optional[str] = None) -> str:
         lines.append(f"  Last evidence: {last}")
     else:
         lines.append("  (no active run)")
+    # Resumable queue run block (ISSUE-0007). Only emitted when a resumable
+    # merge-* queue log exists, so AC-QR-019 byte-identical output holds
+    # when no such log is present.
+    resumable = _find_resumable_queue_run(target)
+    if resumable is not None:
+        step = len(resumable.get("issues") or [])
+        lines.append("")
+        lines.append("Queue run:")
+        lines.append(f"  run id: {resumable.get('run_id', '?')}")
+        lines.append(
+            f"  current issue: "
+            f"{_resumable_queue_current_issue(resumable, target)}")
+        lines.append(f"  step: {step}")
+        lines.append(
+            f"  merge policy: {resumable.get('merge_policy', '?')}")
+        lines.append(f"  consecutive: {step}")
     lines.append("")
     lines.append("Next action:")
     if queue.get("approved") and not active_run:
