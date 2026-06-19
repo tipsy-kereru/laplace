@@ -23,15 +23,24 @@ re-implement state transitions, fix-attempt limits, test-evidence gates, or
 security checks -- those live inside runner.py primitives. queue_runner only
 composes them and maps their exit codes to advance/halt decisions.
 
-Merge execution is out of scope for this issue. `_handle_merge_policy`
-(ISSUE-0004) detects whether the human has merged the issue branch into the
-base branch via `git merge-base --is-ancestor`. When merged, the queue
-advances to the next issue; otherwise it halts with `merge-wait:<id>`.
+Merge execution is governed by the configured ``merge_policy``:
+
+- ``wait-for-human-merge`` (default, ISSUE-0004): detect whether the human
+  has merged the issue branch into the base branch via
+  ``git merge-base --is-ancestor``. When merged, the queue advances;
+  otherwise it halts with ``merge-wait:<id>``.
+- ``auto-merge-branch`` (ISSUE-0005): merge the issue branch into the
+  integration branch ``laplace/queue-<queue_run_id>`` (the ONLY git merge
+  target, hardcoded -- ``main``/``master`` can NEVER be targets by
+  construction). Clean merge advances; conflict aborts and halts with
+  ``merge-conflict:<id>``; non-repo halts with
+  ``merge-not-a-git-repo:<id>``; policy denial halts with
+  ``merge-policy-denied:<id>``.
 
 GATE ROUTING CONTRACT (AC-QR-G2): every git command queue_runner issues is
-routed through policy.check_command first. The merge-base probe respects
-that contract; on policy denial the probe fails safe (False -> halt ->
-re-emit merge-wait).
+routed through policy.check_command first. The merge-base probe and the
+auto-merge sequence both respect that contract; on policy denial they fail
+safe (halt).
 """
 
 
@@ -92,8 +101,17 @@ def _read_issue_run_id(issue_id: str, target: Optional[str]) -> Optional[str]:
     return rid if rid else None
 
 
+# Merge policy reason tokens (second element of the _handle_merge_policy
+# return tuple). Empty string means "advance, no halt reason".
+_MERGE_REASON_WAIT = "merge-wait"
+_MERGE_REASON_CONFLICT = "merge-conflict"
+_MERGE_REASON_NOT_REPO = "merge-not-a-git-repo"
+_MERGE_REASON_POLICY_DENIED = "merge-policy-denied"
+
+
 # ---------------------------------------------------------------------------
-# Merge policy (AC-QR-007; ISSUE-0004: wait-for-human-merge detection)
+# Merge policy (AC-QR-007; ISSUE-0004: wait-for-human-merge detection;
+# ISSUE-0005: auto-merge-branch integration-branch merge)
 # ---------------------------------------------------------------------------
 
 def _issue_branch_is_merged(issue_id: str, target: Optional[str]) -> bool:
@@ -147,20 +165,153 @@ def _issue_branch_is_merged(issue_id: str, target: Optional[str]) -> bool:
     return False
 
 
-def _handle_merge_policy(issue_id: str, target: Optional[str]) -> str:
+def _handle_merge_policy(issue_id: str, target: Optional[str],
+                         queue_run_id: str,
+                         merge_policy: str = "wait-for-human-merge") \
+        -> Tuple[str, str]:
     """Decide advance vs halt after an issue reaches review-passed.
 
-    ISSUE-0004 (wait-for-human-merge): advances only when the issue's branch
-    has been merged into the base branch (main, falling back to master).
-    Otherwise halts so the run-queue is re-invoked after the human merges.
+    ISSUE-0005: dispatches on `merge_policy`.
 
-    Returns one of {"advance", "halt"}.
+    - ``wait-for-human-merge`` (default): advances only when the issue's
+      branch has been merged into the base branch (main, falling back to
+      master). Otherwise halts with ``merge-wait``. Detection reuses
+      ``_issue_branch_is_merged`` (fail-safe).
+    - ``auto-merge-branch``: merges the issue branch into the integration
+      branch ``laplace/queue-<queue_run_id>`` via ``_auto_merge_issue``.
+      Clean merge advances; conflict or policy denial halts.
+
+    Returns ``(decision, reason_token)`` where ``decision`` is one of
+    ``{"advance", "halt"}`` and ``reason_token`` is one of ``{""``,
+    ``"merge-wait"``, ``"merge-conflict"``, ``"merge-not-a-git-repo"``,
+    ``"merge-policy-denied"}``. ``reason_token`` is empty when
+    ``decision == "advance"``.
     """
     if not issue_id:
-        return "halt"
+        # Defensive: no branch to merge. Treat as a merge-wait halt so the
+        # human can investigate; never auto-advance on empty issue id.
+        return ("halt", _MERGE_REASON_WAIT)
+
+    if merge_policy == "auto-merge-branch":
+        return _auto_merge_issue(issue_id, queue_run_id, target)
+
+    # Default / wait-for-human-merge.
     if _issue_branch_is_merged(issue_id, target):
-        return "advance"
-    return "halt"
+        return ("advance", "")
+    return ("halt", _MERGE_REASON_WAIT)
+
+
+def _integration_branch_name(queue_run_id: str) -> str:
+    """Return the integration branch name for a queue run.
+
+    INVARIANT (protected-ref guard): this is the ONLY branch ever used as a
+    ``git merge`` target by the auto-merge path. It is hardcoded and derived
+    solely from the queue run id -- never from config or user input. As a
+    structural consequence, ``main``/``master``/any configured protected ref
+    can NEVER be a merge target here. Do not parameterize this.
+    """
+    return f"{_BRANCH_PREFIX}/queue-{queue_run_id}"
+
+
+def _auto_merge_issue(issue_id: str, queue_run_id: str,
+                      target: Optional[str]) -> Tuple[str, str]:
+    """Merge the issue branch into the integration branch (ISSUE-0005).
+
+    Integration branch is ``laplace/queue-<queue_run_id>`` -- lazily created
+    from base (main, fallback master) on first auto-merge.
+
+    Sequence (every git op routed through ``policy.check_command`` first):
+      1. Non-repo (no .git) -> (halt, merge-not-a-git-repo).
+      2. policy.check_command denial on any op -> (halt, merge-policy-denied).
+      3. Resolve integration branch; create from base if absent.
+      4. checkout integration branch.
+      5. merge --no-ff laplace/<issue_id>. Exit 0 -> (advance, "").
+      6. Conflict: best-effort ``git merge --abort`` -> (halt, merge-conflict).
+
+    No push, no force, no fallback to wait-for-human-merge.
+    """
+    root = state._harness_root(target)
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return ("halt", _MERGE_REASON_NOT_REPO)
+
+    safe = issue_id.replace("/", "_")
+    issue_branch = f"{_BRANCH_PREFIX}/{safe}"
+    integration = _integration_branch_name(queue_run_id)
+
+    def _checked(op_argv: List[str], op_label: str) \
+            -> Optional[subprocess.CompletedProcess]:
+        """Route an op through policy.check_command; return None if denied.
+
+        Builds the command string the way policy patterns expect (leading
+        ``git ``) so the DENY patterns match correctly.
+        """
+        cmd_str = "git " + " ".join(op_argv)
+        ok, _reason = policy.check_command(cmd_str)
+        if not ok:
+            return None
+        try:
+            return subprocess.run(
+                ["git", "-C", root] + op_argv,
+                capture_output=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            # git missing / timed out / OS error -> treat as policy/infra
+            # denial; the human should investigate. Do NOT fall back.
+            return None
+
+    # Resolve base branch for lazy integration-branch creation.
+    base = None
+    for cand in ("main", "master"):
+        r = _checked(["rev-parse", "--verify", cand], "rev-parse base")
+        if r is None:
+            return ("halt", _MERGE_REASON_POLICY_DENIED)
+        if r.returncode == 0:
+            base = cand
+            break
+    if base is None:
+        # Neither main nor master exists; cannot derive integration branch.
+        # Fail safe as a policy-denied halt (no protected-ref risk).
+        return ("halt", _MERGE_REASON_POLICY_DENIED)
+
+    # Create integration branch from base if it does not exist yet.
+    r_int = _checked(["rev-parse", "--verify", integration],
+                     "rev-parse integration")
+    if r_int is None:
+        return ("halt", _MERGE_REASON_POLICY_DENIED)
+    if r_int.returncode != 0:
+        r_create = _checked(["branch", integration, base], "create integration")
+        if r_create is None:
+            return ("halt", _MERGE_REASON_POLICY_DENIED)
+        if r_create.returncode != 0:
+            return ("halt", _MERGE_REASON_POLICY_DENIED)
+
+    # Checkout the integration branch (the ONLY merge target; see
+    # _integration_branch_name invariant comment).
+    r_co = _checked(["checkout", integration], "checkout integration")
+    if r_co is None:
+        return ("halt", _MERGE_REASON_POLICY_DENIED)
+    if r_co.returncode != 0:
+        return ("halt", _MERGE_REASON_POLICY_DENIED)
+
+    # Merge the issue branch into the integration branch.
+    r_merge = _checked(["merge", "--no-ff", issue_branch], "merge issue")
+    if r_merge is None:
+        return ("halt", _MERGE_REASON_POLICY_DENIED)
+    if r_merge.returncode == 0:
+        return ("advance", "")
+
+    # Conflict path: best-effort abort, never force.
+    r_abort = _checked(["merge", "--abort"], "abort conflict")
+    if r_abort is None:
+        # Abort denied or infra-failed; log via stderr and still report
+        # merge-conflict (the merge already failed).
+        print("auto-merge: git merge --abort could not be executed",
+              file=sys.stderr)
+    elif r_abort.returncode != 0:
+        print("auto-merge: git merge --abort failed",
+              file=sys.stderr)
+    return ("halt", _MERGE_REASON_CONFLICT)
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +464,9 @@ def _process_issue(issue_id: str, target: Optional[str],
 
 def _decide(result: IssueResult, next_issue: Optional[str],
             max_queue_run: int, consecutive: int,
-            target: Optional[str],
-            policy_override: Optional[Callable[[str, Optional[str]], str]] = None) \
+            target: Optional[str], queue_run_id: str,
+            merge_policy: str = "wait-for-human-merge",
+            policy_override: Optional[Callable[[str, Optional[str]], Tuple[str, str]]] = None) \
         -> Tuple[bool, str]:
     """Return (halt, outcome) for the post-issue decision.
 
@@ -337,11 +489,12 @@ def _decide(result: IssueResult, next_issue: Optional[str],
     # from it); recover the issue id from the child run log.
     issue_id = _issue_from_run(result, target)
     if policy_override is not None:
-        decision = policy_override(issue_id, target)
+        decision, reason_token = policy_override(issue_id, target)
     else:
-        decision = _handle_merge_policy(issue_id, target)
+        decision, reason_token = _handle_merge_policy(
+            issue_id, target, queue_run_id, merge_policy)
     if decision == "halt":
-        return True, f"merge-wait:{issue_id}"
+        return True, f"{reason_token}:{issue_id}"
 
     # decision == "advance"
     if next_issue is None:
@@ -381,7 +534,7 @@ def _issue_from_run(result: IssueResult, target: Optional[str]) -> str:
 def _run_queue(start_issue: Optional[str], target: Optional[str],
                config: Dict[str, Any],
                issue_driver: Optional[Callable[[str, Optional[str]], None]],
-               policy_override: Optional[Callable[[str, Optional[str]], str]] = None) \
+               policy_override: Optional[Callable[[str, Optional[str]], Tuple[str, str]]] = None) \
         -> Tuple[str, int]:
     """Iterate the approved queue from `start_issue` (or queue head).
 
@@ -436,7 +589,9 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
 
         next_issue = approved[idx + 1] if idx + 1 < len(approved) else None
         halt, outcome = _decide(result, next_issue, max_queue_run,
-                                consecutive, target,
+                                consecutive, target, queue_run_id,
+                                merge_policy=config.get(
+                                    "merge_policy", "wait-for-human-merge"),
                                 policy_override=policy_override)
 
         if not halt:
@@ -451,10 +606,8 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
         print(f"queue halted: {outcome}")
         # Expected halts (clean skill handoff) exit 0; unexpected halts
         # (blocked terminal, non-terminal, unmet dep, held lock) non-zero.
-        if outcome.startswith("merge-wait") \
-                or outcome == "queue-exhausted" \
-                or outcome.startswith("max-queue-run-reached") \
-                or outcome.startswith("noop-"):
+        if outcome.startswith(("merge-", "queue-exhausted",
+                               "max-queue-run-reached", "noop-")):
             return queue_run_id, EXIT_OK
         return queue_run_id, EXIT_INVALID
 
@@ -494,16 +647,23 @@ def selftest() -> int:
     sys.stderr = open(os.devnull, "w")
     try:
         # --- _handle_merge_policy: wait-for-human-merge detection --------
-        # Empty issue id -> halt (defensive).
-        if _handle_merge_policy("", tmp) != "halt":
-            failures.append("_handle_merge_policy('') should return 'halt'")
-        # Non-repo tmp target -> halt, no subprocess crash (fail-safe).
-        if _handle_merge_policy("ISSUE-X", tmp) != "halt":
+        # Empty issue id -> halt, merge-wait (defensive).
+        dec = _handle_merge_policy("", tmp, "selftest-qr-0")
+        if dec != ("halt", "merge-wait"):
+            failures.append(f"_handle_merge_policy('') should be "
+                            f"('halt','merge-wait'), got {dec!r}")
+        # Non-repo tmp target -> halt, merge-wait, no subprocess crash
+        # (fail-safe under wait-for-human-merge).
+        if _handle_merge_policy("ISSUE-X", tmp, "selftest-qr-0") \
+                != ("halt", "merge-wait"):
             failures.append(
-                "_handle_merge_policy non-repo should return 'halt'")
-        if _handle_merge_policy("ISSUE-X", None) != "halt":
+                "_handle_merge_policy non-repo should be "
+                "('halt','merge-wait')")
+        if _handle_merge_policy("ISSUE-X", None, "selftest-qr-0") \
+                != ("halt", "merge-wait"):
             failures.append(
-                "_handle_merge_policy non-repo (None target) should 'halt'")
+                "_handle_merge_policy non-repo (None target) should be "
+                "('halt','merge-wait')")
 
         # Real git repo: merged branch -> advance; unmerged -> halt.
         def _git(args, cwd):
@@ -537,9 +697,10 @@ def selftest() -> int:
             _git(["checkout", "-q", "main"], repo_main)
             _git(["merge", "-q", "--no-ff", "laplace/ISSUE-M",
                   "-m", "merge issue"], repo_main)
-            if _handle_merge_policy("ISSUE-M", repo_main) != "advance":
+            if _handle_merge_policy("ISSUE-M", repo_main, "selftest-qr-1") \
+                    != ("advance", ""):
                 failures.append(
-                    "merged branch on main should return 'advance'")
+                    "merged branch on main should return ('advance','')")
             # _issue_branch_is_merged direct check
             if not _issue_branch_is_merged("ISSUE-M", repo_main):
                 failures.append(
@@ -556,9 +717,10 @@ def selftest() -> int:
                 f.write("change\n")
             _git(["add", "g.txt"], repo_unmerged)
             _git(["commit", "-q", "-m", "issue change"], repo_unmerged)
-            if _handle_merge_policy("ISSUE-U", repo_unmerged) != "halt":
+            if _handle_merge_policy("ISSUE-U", repo_unmerged,
+                                    "selftest-qr-2") != ("halt", "merge-wait"):
                 failures.append(
-                    "unmerged branch should return 'halt'")
+                    "unmerged branch should return ('halt','merge-wait')")
             if _issue_branch_is_merged("ISSUE-U", repo_unmerged):
                 failures.append(
                     "_issue_branch_is_merged should be False for unmerged")
@@ -577,14 +739,15 @@ def selftest() -> int:
             _git(["checkout", "-q", "master"], repo_master)
             _git(["merge", "-q", "--no-ff", "laplace/ISSUE-MS",
                   "-m", "merge issue"], repo_master)
-            if _handle_merge_policy("ISSUE-MS", repo_master) != "advance":
+            if _handle_merge_policy("ISSUE-MS", repo_master,
+                                    "selftest-qr-3") != ("advance", ""):
                 failures.append(
-                    "merged branch on master should return 'advance'")
+                    "merged branch on master should return ('advance','')")
         finally:
             shutil.rmtree(repo_master, ignore_errors=True)
 
         def _advance_policy(issue_id, target):  # noqa: ARG001
-            return "advance"
+            return ("advance", "")
 
         # --- AC-QR-NOOP: empty approved queue -> exit 0, no parent log ---
         if state.cmd_init(target=tmp) != 0:
@@ -819,6 +982,159 @@ def selftest() -> int:
         if "ISSUE-R2" not in q_after.get("approved", []):
             failures.append(
                 "resume char: ISSUE-R2 should still be in approved queue")
+
+        # --- AC-QR-013/014 auto-merge-branch policy (ISSUE-0005) ---------
+        # 1. _auto_merge_issue direct: clean merge -> advance on real repo.
+        # 2. _auto_merge_issue direct: conflict -> halt, merge-conflict.
+        # 3. _auto_merge_issue direct: non-repo -> halt, merge-not-a-git-repo.
+        # 4. Integration: _run_queue with auto-merge-branch policy drives
+        #    two review-passed issues and queue-exhausts (clean merges).
+
+        # 1. Clean merge path.
+        repo_am = _make_repo("main")
+        try:
+            assert state.cmd_init(target=repo_am) == 0
+            # ISSUE-AM has a commit on its branch (created by _make_repo +
+            # this checkout). main has only the initial commit, so merging
+            # the issue branch brings new content -> clean --no-ff merge.
+            _git(["checkout", "-q", "-b", "laplace/ISSUE-AM"], repo_am)
+            with open(os.path.join(repo_am, "am.txt"), "w") as f:
+                f.write("auto-merge\n")
+            _git(["add", "am.txt"], repo_am)
+            _git(["commit", "-q", "-m", "am work"], repo_am)
+            _git(["checkout", "-q", "main"], repo_am)
+            qr_id = "am-selftest-1"
+            dec_am = _auto_merge_issue("ISSUE-AM", qr_id, repo_am)
+            if dec_am != ("advance", ""):
+                failures.append(
+                    f"_auto_merge_issue clean merge should be "
+                    f"('advance',''), got {dec_am!r}")
+            # Integration branch must now exist and contain the merged work.
+            r_has = subprocess.run(
+                ["git", "-C", repo_am, "rev-parse", "--verify",
+                 _integration_branch_name(qr_id)],
+                capture_output=True)
+            if r_has.returncode != 0:
+                failures.append(
+                    "auto-merge: integration branch was not created")
+            # HEAD should be on the integration branch.
+            r_head = subprocess.run(
+                ["git", "-C", repo_am, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True)
+            if r_head.stdout.strip() != _integration_branch_name(qr_id):
+                failures.append(
+                    f"auto-merge: HEAD should be on integration branch, "
+                    f"got {r_head.stdout.strip()!r}")
+            # The merged file must be present on the integration branch.
+            if not os.path.exists(os.path.join(repo_am, "am.txt")):
+                failures.append(
+                    "auto-merge: merged file missing on integration branch")
+        finally:
+            shutil.rmtree(repo_am, ignore_errors=True)
+
+        # 2. Conflict path.
+        repo_conf = _make_repo("main")
+        try:
+            # Issue branch modifies README.md to "issue\n".
+            _git(["checkout", "-q", "-b", "laplace/ISSUE-CONF"], repo_conf)
+            with open(os.path.join(repo_conf, "README.md"), "w") as f:
+                f.write("issue\n")
+            _git(["add", "README.md"], repo_conf)
+            _git(["commit", "-q", "-m", "issue edit"], repo_conf)
+            # Pre-seed the integration branch from main, then make a
+            # conflicting change there so the merge will conflict.
+            _git(["checkout", "-q", "main"], repo_conf)
+            _git(["branch", "laplace/queue-am-conf-2"], repo_conf)
+            _git(["checkout", "-q", "laplace/queue-am-conf-2"], repo_conf)
+            with open(os.path.join(repo_conf, "README.md"), "w") as f:
+                f.write("integration\n")
+            _git(["add", "README.md"], repo_conf)
+            _git(["commit", "-q", "-m", "integration edit"], repo_conf)
+            _git(["checkout", "-q", "main"], repo_conf)
+            qr_conf = "am-conf-2"
+            dec_conf = _auto_merge_issue("ISSUE-CONF", qr_conf, repo_conf)
+            if dec_conf != ("halt", "merge-conflict"):
+                failures.append(
+                    f"_auto_merge_issue conflict should be "
+                    f"('halt','merge-conflict'), got {dec_conf!r}")
+            # After abort, HEAD must still resolve (no stuck merge state).
+            r_head2 = subprocess.run(
+                ["git", "-C", repo_conf, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True)
+            if r_head2.returncode != 0:
+                failures.append(
+                    "auto-merge conflict: HEAD unresolved after abort")
+        finally:
+            shutil.rmtree(repo_conf, ignore_errors=True)
+
+        # 3. Non-repo path.
+        tmp_nonrepo = tempfile.mkdtemp(prefix="laplace-am-nonrepo-")
+        try:
+            dec_nr = _auto_merge_issue("ISSUE-NR", "am-nr-3", tmp_nonrepo)
+            if dec_nr != ("halt", "merge-not-a-git-repo"):
+                failures.append(
+                    f"_auto_merge_issue non-repo should be "
+                    f"('halt','merge-not-a-git-repo'), got {dec_nr!r}")
+            # Also via _handle_merge_policy dispatch.
+            dec_nr2 = _handle_merge_policy(
+                "ISSUE-NR", tmp_nonrepo, "am-nr-3",
+                merge_policy="auto-merge-branch")
+            if dec_nr2 != ("halt", "merge-not-a-git-repo"):
+                failures.append(
+                    f"_handle_merge_policy auto non-repo should be "
+                    f"('halt','merge-not-a-git-repo'), got {dec_nr2!r}")
+        finally:
+            shutil.rmtree(tmp_nonrepo, ignore_errors=True)
+
+        # 4. Integration: auto-merge-branch through _run_queue.
+        repo_i = _make_repo("main")
+        try:
+            assert state.cmd_init(target=repo_i) == 0
+            cfg_am = {"max_queue_run": 5,
+                      "merge_policy": "auto-merge-branch"}
+            state._save_tasks({}, target=repo_i)
+            state._save_queue(state.DEFAULT_QUEUE, target=repo_i)
+            # Seed ISSUE-I1 directly against repo_i (the local seed_approved
+            # helper closes over `tmp`, the non-repo harness).
+            tasks_i = state._load_tasks(repo_i)
+            tasks_i["ISSUE-I1"] = {"status": "draft",
+                                   "updated_at": time.time()}
+            state._save_tasks(tasks_i, target=repo_i)
+            q_i = state._load_queue(repo_i)
+            if "ISSUE-I1" not in q_i["draft"]:
+                q_i["draft"].append("ISSUE-I1")
+            state._save_queue(q_i, target=repo_i)
+            assert state.cmd_approve(argparse.Namespace(
+                issue_id="ISSUE-I1", user="tester", target=repo_i)) == 0
+
+            def drive_with_commit_am(issue_id, target):
+                marker = f"{issue_id}.txt"
+                with open(os.path.join(target, marker), "w") as f:
+                    f.write(f"{issue_id}\n")
+                _git(["add", marker], target)
+                _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+                drive_to_review_passed(issue_id, target)
+
+            rid_i, rc_i = _run_queue(None, repo_i, cfg_am, drive_with_commit_am)
+            log_i = state._read_json(_queue_run_log_path(rid_i, repo_i),
+                                     default=None)
+            if not log_i or log_i.get("outcome") != "queue-exhausted":
+                failures.append(
+                    f"auto-merge integration: expected queue-exhausted, "
+                    f"got {log_i.get('outcome') if log_i else None}")
+            # Integration branch must exist with the merged work.
+            r_i_has = subprocess.run(
+                ["git", "-C", repo_i, "rev-parse", "--verify",
+                 _integration_branch_name(rid_i)],
+                capture_output=True)
+            if r_i_has.returncode != 0:
+                failures.append(
+                    "auto-merge integration: integration branch missing")
+            if not os.path.exists(os.path.join(repo_i, "ISSUE-I1.txt")):
+                failures.append(
+                    "auto-merge integration: merged file missing")
+        finally:
+            shutil.rmtree(repo_i, ignore_errors=True)
 
         # --- Characterization: runner primitives unaffected --------------
         # Direct runner.cmd_start + cmd_end still works (no queue_runner).

@@ -75,7 +75,7 @@ def _drive_to_blocked(issue_id, target):
 
 
 def _policy_advance(issue_id, target):  # noqa: ARG001
-    return "advance"
+    return ("advance", "")
 
 
 def _log(tmp, run_id):
@@ -88,19 +88,23 @@ def _log(tmp, run_id):
 # ---------------------------------------------------------------------------
 
 def test_handle_merge_policy_empty_issue_returns_halt():
-    assert queue_runner._handle_merge_policy("", None) == "halt"
+    assert queue_runner._handle_merge_policy("", None, "qr-0") \
+        == ("halt", "merge-wait")
 
 
 def test_handle_merge_policy_non_repo_returns_halt():
-    # A plain temp dir with no .git is fail-safe -> halt.
+    # A plain temp dir with no .git is fail-safe -> halt (merge-wait under
+    # the default wait-for-human-merge policy).
     tmp = tempfile.mkdtemp(prefix="laplace-mp-nonrepo-")
     try:
-        assert queue_runner._handle_merge_policy("ISSUE-X", tmp) == "halt"
+        assert queue_runner._handle_merge_policy("ISSUE-X", tmp, "qr-0") \
+            == ("halt", "merge-wait")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     # None target -> resolves to CWD which is not the issue branch's repo;
     # fail-safe -> halt without raising.
-    assert queue_runner._handle_merge_policy("ISSUE-X", None) == "halt"
+    assert queue_runner._handle_merge_policy("ISSUE-X", None, "qr-0") \
+        == ("halt", "merge-wait")
 
 
 def _git(args, cwd):
@@ -133,7 +137,8 @@ def test_issue_branch_is_merged_true_on_main():
         _git(["checkout", "-q", "main"], repo)
         _git(["merge", "-q", "--no-ff", "laplace/ISSUE-M", "-m", "merge"], repo)
         assert queue_runner._issue_branch_is_merged("ISSUE-M", repo) is True
-        assert queue_runner._handle_merge_policy("ISSUE-M", repo) == "advance"
+        assert queue_runner._handle_merge_policy("ISSUE-M", repo, "qr-1") \
+            == ("advance", "")
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -147,7 +152,8 @@ def test_issue_branch_is_merged_false_when_unmerged():
         _git(["add", "g.txt"], repo)
         _git(["commit", "-q", "-m", "change"], repo)
         assert queue_runner._issue_branch_is_merged("ISSUE-U", repo) is False
-        assert queue_runner._handle_merge_policy("ISSUE-U", repo) == "halt"
+        assert queue_runner._handle_merge_policy("ISSUE-U", repo, "qr-2") \
+            == ("halt", "merge-wait")
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -163,7 +169,8 @@ def test_issue_branch_is_merged_falls_back_to_master():
         _git(["checkout", "-q", "master"], repo)
         _git(["merge", "-q", "--no-ff", "laplace/ISSUE-MS", "-m", "merge"], repo)
         assert queue_runner._issue_branch_is_merged("ISSUE-MS", repo) is True
-        assert queue_runner._handle_merge_policy("ISSUE-MS", repo) == "advance"
+        assert queue_runner._handle_merge_policy("ISSUE-MS", repo, "qr-3") \
+            == ("advance", "")
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -174,6 +181,178 @@ def test_issue_branch_is_merged_missing_branch_returns_false():
         # Branch never created -> not an ancestor.
         assert queue_runner._issue_branch_is_merged("ISSUE-NOPE", repo) \
             is False
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Merge policy (ISSUE-0005: auto-merge-branch)
+# ---------------------------------------------------------------------------
+
+def test_integration_branch_name_is_protected_ref_guarded():
+    """The integration branch name is hardcoded from the queue run id only.
+
+    AC-QR-014 (structural): main/master can NEVER be a merge target because
+    the target name is derived solely from the queue run id.
+    """
+    name = queue_runner._integration_branch_name("abc123")
+    assert name == "laplace/queue-abc123"
+    # Independent of any target/config/user input -- pure function of run id.
+    assert queue_runner._integration_branch_name("def456") \
+        == "laplace/queue-def456"
+
+
+def test_auto_merge_issue_clean_merge_advances():
+    """AC-QR-013: clean merge into integration branch -> advance."""
+    repo = _make_repo("main")
+    try:
+        # Create an issue branch with a commit (forward of main).
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-C"], repo)
+        with open(os.path.join(repo, "c.txt"), "w") as f:
+            f.write("c\n")
+        _git(["add", "c.txt"], repo)
+        _git(["commit", "-q", "-m", "c"], repo)
+        _git(["checkout", "-q", "main"], repo)
+        qr = "am-clean-1"
+        result = queue_runner._auto_merge_issue("ISSUE-C", qr, repo)
+        assert result == ("advance", ""), result
+        # Integration branch exists.
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify",
+             queue_runner._integration_branch_name(qr)],
+            capture_output=True)
+        assert r.returncode == 0, "integration branch not created"
+        # HEAD is on the integration branch.
+        r_head = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True)
+        assert r_head.stdout.strip() == queue_runner._integration_branch_name(qr)
+        # main was NOT modified (no fast-forward of protected ref).
+        r_main = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "main"],
+            capture_output=True, text=True)
+        r_int = subprocess.run(
+            ["git", "-C", repo, "rev-parse",
+             queue_runner._integration_branch_name(qr)],
+            capture_output=True, text=True)
+        # main's tip and integration's tip differ (main untouched).
+        assert r_main.stdout != r_int.stdout
+        # merged content is on integration branch.
+        assert os.path.exists(os.path.join(repo, "c.txt"))
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_auto_merge_issue_conflict_halts_with_abort():
+    """AC-QR-013: conflict -> halt + merge-conflict; merge aborted, no force."""
+    repo = _make_repo("main")
+    try:
+        # Issue branch edits README.md to "issue".
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-CF"], repo)
+        with open(os.path.join(repo, "README.md"), "w") as f:
+            f.write("issue\n")
+        _git(["add", "README.md"], repo)
+        _git(["commit", "-q", "-m", "cf"], repo)
+        # Pre-create the integration branch with a conflicting edit.
+        _git(["checkout", "-q", "main"], repo)
+        qr = "am-conflict-1"
+        int_branch = queue_runner._integration_branch_name(qr)
+        _git(["branch", int_branch], repo)
+        _git(["checkout", "-q", int_branch], repo)
+        with open(os.path.join(repo, "README.md"), "w") as f:
+            f.write("integration\n")
+        _git(["add", "README.md"], repo)
+        _git(["commit", "-q", "-m", "int edit"], repo)
+        _git(["checkout", "-q", "main"], repo)
+        result = queue_runner._auto_merge_issue("ISSUE-CF", qr, repo)
+        assert result == ("halt", "merge-conflict"), result
+        # No stuck merge state (abort cleaned up).
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True)
+        assert r.returncode == 0
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_auto_merge_issue_non_repo_halts():
+    """Non-repo -> halt, merge-not-a-git-repo (no fallback)."""
+    tmp = tempfile.mkdtemp(prefix="laplace-am-nr-")
+    try:
+        result = queue_runner._auto_merge_issue("ISSUE-NR", "am-nr", tmp)
+        assert result == ("halt", "merge-not-a-git-repo"), result
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_handle_merge_policy_dispatches_auto_merge():
+    """_handle_merge_policy dispatches on merge_policy to auto-merge path."""
+    repo = _make_repo("main")
+    try:
+        _git(["checkout", "-q", "-b", "laplace/ISSUE-D"], repo)
+        with open(os.path.join(repo, "d.txt"), "w") as f:
+            f.write("d\n")
+        _git(["add", "d.txt"], repo)
+        _git(["commit", "-q", "-m", "d"], repo)
+        _git(["checkout", "-q", "main"], repo)
+        qr = "am-dispatch-1"
+        result = queue_runner._handle_merge_policy(
+            "ISSUE-D", repo, qr, merge_policy="auto-merge-branch")
+        assert result == ("advance", ""), result
+        # Integration branch created.
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify",
+             queue_runner._integration_branch_name(qr)],
+            capture_output=True)
+        assert r.returncode == 0
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_handle_merge_policy_auto_non_repo_no_fallback():
+    """auto-merge-branch on non-repo halts merge-not-a-git-repo; does NOT
+    fall back to wait-for-human-merge."""
+    tmp = tempfile.mkdtemp(prefix="laplace-am-nr-dispatch-")
+    try:
+        result = queue_runner._handle_merge_policy(
+            "ISSUE-NR", tmp, "am-nr-2", merge_policy="auto-merge-branch")
+        assert result == ("halt", "merge-not-a-git-repo"), result
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_run_queue_auto_merge_branch_advances_through_queue():
+    """Integration: auto-merge-branch policy chains two review-passed issues
+    via the integration branch and queue-exhausts (AC-QR-013)."""
+    repo = _make_repo("main")
+    try:
+        assert state.cmd_init(target=repo) == 0
+        cfg = {"max_queue_run": 5, "merge_policy": "auto-merge-branch"}
+        _seed_approved(repo, "ISSUE-A1")
+        _seed_approved(repo, "ISSUE-A2")
+
+        def drive_with_commit(issue_id, target):
+            marker = f"{issue_id}.txt"
+            with open(os.path.join(target, marker), "w") as f:
+                f.write(f"{issue_id}\n")
+            _git(["add", marker], target)
+            _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+            _drive_to_review_passed(issue_id, target)
+
+        rid, rc = queue_runner._run_queue(None, repo, cfg, drive_with_commit)
+        assert rc == 0
+        log = _log(repo, rid)
+        assert log["outcome"] == "queue-exhausted", log["outcome"]
+        # Integration branch exists with both merged files.
+        int_branch = queue_runner._integration_branch_name(rid)
+        r = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", int_branch],
+            capture_output=True)
+        assert r.returncode == 0
+        assert os.path.exists(os.path.join(repo, "ISSUE-A1.txt"))
+        assert os.path.exists(os.path.join(repo, "ISSUE-A2.txt"))
+        # One queue_step recorded (A1 -> A2 advance).
+        assert len(log["queue_steps"]) == 1
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
