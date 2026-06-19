@@ -279,6 +279,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:intake <prd>` | Convert PRD/story into local draft issues |
 | `/laplace:approve <issue>` | Move draft issue to approved queue |
 | `/laplace:run [issue]` | Execute one issue loop |
+| `/laplace:run-queue [issue]` | Run approved issues as a queue — auto-advances on review-passed, halts at gates |
 | `/laplace:status` | Show current harness state |
 | `/laplace:report <issue>` | Generate or show issue report |
 | `/laplace:cancel [issue]` | Stop active loop safely |
