@@ -20,5 +20,5 @@ Print the runner's parent-run outcome verbatim (the result block, the queue-run 
 - `merge-conflict:<id>` — Auto-merge of `<id>` conflicted on integration branch `laplace/queue-<run>`. Resolve the conflict manually, then re-run `/laplace:run-queue`.
 - `queue-exhausted` — All approved issues complete.
 - `max-queue-run-reached:<n>` — Cap of `<n>` consecutive issues reached. Re-run `/laplace:run-queue` to continue.
-- `human-approval-required:<id>` or `blocked:<id>` — Surface the runner's reason verbatim. Resolve via the existing exception flow; do not retry here.
+- `terminal:<final>` (e.g. `terminal:blocked`, `terminal:human-approval-required`) — Issue did not reach `review-passed`. Surface the runner's reason verbatim. Resolve via the existing exception flow; do not retry here.
 - Any other non-zero exit (`held-lock:<id>`, `fix-limit-exceeded:<id>`, `start-failed:<id>:<rc>`, non-terminal halt) — Report as an error and recommend `/laplace:status`. Do not retry.
