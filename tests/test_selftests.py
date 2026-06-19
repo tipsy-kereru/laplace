@@ -22,6 +22,7 @@ SELFTEST_TARGETS = [
     ("scripts/state.py", "state"),
     ("scripts/intake.py", "intake"),
     ("scripts/runner.py", "runner"),
+    ("scripts/queue_runner.py", "queue-runner"),
     ("scripts/report.py", "report"),
     ("scripts/profile.py", "profile"),
     ("scripts/validate.py", "validate"),
