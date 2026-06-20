@@ -132,8 +132,11 @@ def _atomic_write_text(path: str, text: str) -> None:
 def _read_json(path: str, default: Any = None) -> Any:
     if not os.path.exists(path):
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
 # --- File locking ---------------------------------------------------------------
@@ -1204,6 +1207,25 @@ def selftest() -> int:
             failures.append("discard with run history mutated tasks.json")
         # cleanup so subsequent lock test isn't polluted
         os.remove(os.path.join(_runs_dir(target=tmp), "fakedeadbeef.json"))
+
+        # 12b. cmd_discard: malformed runs/*.json must not crash (rc in {0,2}).
+        _save_tasks({
+            "ISSUE-DISCARD-3B": {"status": "draft", "updated_at": time.time()},
+        }, target=tmp)
+        dq3b = _load_queue(target=tmp)
+        dq3b["draft"].append("ISSUE-DISCARD-3B")
+        _save_queue(dq3b, target=tmp)
+        with open(os.path.join(_runs_dir(target=tmp), "bad.json"), "w") as bf:
+            bf.write("{ this is not valid json")
+        ns = argparse.Namespace(issue_id="ISSUE-DISCARD-3B", target=tmp)
+        try:
+            rc = cmd_discard(ns)
+        except Exception as exc:  # noqa: BLE001 - any crash is a failure here
+            failures.append(f"discard crashed on malformed runs json: {exc!r}")
+            rc = -1
+        if rc not in (0, 2):
+            failures.append(f"discard with malformed runs json should rc in (0,2), got {rc}")
+        os.remove(os.path.join(_runs_dir(target=tmp), "bad.json"))
 
         # 13. cmd_discard: lock contention exits 3
         ok, _ = acquire_lock(INTAKE_LOCK_ID, target=tmp)
