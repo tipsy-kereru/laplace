@@ -263,6 +263,7 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 | `/laplace:init` | Once per project |
 | `/laplace:intake <prd>` | Have a PRD/story ready to convert |
 | `/laplace:approve <issue>` | You reviewed a draft and want it in the queue |
+| `/laplace:discard <issue>` | A draft was created by mistake and should not exist (draft-only) |
 | `/laplace:run [issue]` | Execute or resume a loop |
 | `/laplace:run-queue [issue]` | Multiple issues approved, want them run in order |
 | `/laplace:status` | Check queue, active run, blockers |

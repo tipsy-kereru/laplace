@@ -36,6 +36,10 @@ VALID_MERGE_POLICIES = {"wait-for-human-merge", "auto-merge-branch"}
 
 LOCK_TTL_SECONDS = 60 * 60  # stale-lock detection window (60 min default)
 
+# Lock ID for the ID-allocation / draft-mutation critical section. Shared with
+# intake.py (which imports this constant) so intake and discard cannot race.
+INTAKE_LOCK_ID = "ISSUE-INTAKE"
+
 # --- State machine (SPEC-002 §State Machine) -----------------------------------
 
 VALID_TRANSITIONS: Dict[str, List[str]] = {
@@ -128,8 +132,11 @@ def _atomic_write_text(path: str, text: str) -> None:
 def _read_json(path: str, default: Any = None) -> Any:
     if not os.path.exists(path):
         return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return default
 
 
 # --- File locking ---------------------------------------------------------------
@@ -858,6 +865,97 @@ def cmd_unlock(args: argparse.Namespace) -> int:
     return 0
 
 
+def _issue_has_run_history(issue_id: str, target: Optional[str] = None) -> bool:
+    """Defense-in-depth check: returns True if any run log under
+    .harness/state/runs/ references this issue_id. Used by cmd_discard to
+    refuse deletion of issues with run history even if status was forced
+    back to draft.
+    """
+    runs_dir = _runs_dir(target)
+    if not os.path.isdir(runs_dir):
+        return False
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = _read_json(os.path.join(runs_dir, name), default=None)
+        if isinstance(log, dict) and log.get("issue_id") == issue_id:
+            return True
+    return False
+
+
+def cmd_discard(args: argparse.Namespace) -> int:
+    """Remove a DRAFT issue atomically (ISSUE-0011, AC-SI-004/005).
+
+    Draft-only safety boundary: refuses any non-draft issue (exit 2). Also
+    refuses if the issue has any run history (exit 2) as defense-in-depth
+    even when status is draft. Removes the issue from tasks.json, ALL queue
+    states (QUEUE_STATES), and deletes .harness/issues/<id>.md. Atomic per
+    file: on any write failure the JSON files are rolled back to their
+    pre-mutation snapshot and the command exits 1.
+    """
+    issue_id = args.issue_id
+    target = args.target
+    ok, reason = acquire_lock(INTAKE_LOCK_ID, target=target)
+    if not ok:
+        print(f"discard lock failed for {issue_id}: {reason}", file=sys.stderr)
+        return 3
+    try:
+        tasks = _load_tasks(target)
+        if issue_id not in tasks:
+            print(f"cannot discard {issue_id}: not found", file=sys.stderr)
+            return 2
+        rec = tasks.get(issue_id, {}) or {}
+        if rec.get("status") != "draft":
+            print(f"cannot discard {issue_id}: only draft allowed "
+                  f"(status={rec.get('status')})", file=sys.stderr)
+            return 2
+        # Defense-in-depth: refuse if any run-log references this issue, or
+        # the tasks record carries a run_id (shouldn't happen for draft, but
+        # the guard is cheap and the safety boundary is load-bearing).
+        if rec.get("run_id") or _issue_has_run_history(issue_id, target=target):
+            print(f"cannot discard {issue_id}: run history exists", file=sys.stderr)
+            return 2
+
+        # Snapshot prior state for rollback.
+        prior_tasks = json.loads(json.dumps(tasks))
+        prior_queue = _load_queue(target)
+
+        try:
+            # Mutate tasks.json
+            new_tasks = json.loads(json.dumps(tasks))
+            new_tasks.pop(issue_id, None)
+            _save_tasks(new_tasks, target=target)
+            # Mutate queue.json: remove from every queue state.
+            new_queue = json.loads(json.dumps(prior_queue))
+            for state in QUEUE_STATES:
+                if issue_id in new_queue.get(state, []):
+                    new_queue[state] = [x for x in new_queue[state]
+                                        if x != issue_id]
+            _save_queue(new_queue, target=target)
+            # Delete the issue file last.
+            issue_path = os.path.join(_issues_dir(target), f"{issue_id}.md")
+            if os.path.exists(issue_path):
+                os.remove(issue_path)
+        except Exception as exc:  # noqa: BLE001 — rollback path
+            # Restore JSON snapshots; best-effort file restore.
+            try:
+                _save_tasks(prior_tasks, target=target)
+            except Exception:
+                pass
+            try:
+                _save_queue(prior_queue, target=target)
+            except Exception:
+                pass
+            print(f"discard {issue_id} failed: {exc} (state rolled back)",
+                  file=sys.stderr)
+            return 1
+    finally:
+        release_lock(INTAKE_LOCK_ID, target=target)
+
+    print(f"discarded {issue_id}: draft -> (removed)")
+    return 0
+
+
 # --- selftest -------------------------------------------------------------------
 
 def selftest() -> int:
@@ -1044,6 +1142,106 @@ def selftest() -> int:
                       "max_stop_hook_iterations", "max_queue_run", "merge_policy"]:
             if limit not in cfg_text:
                 failures.append(f"config.yml missing {limit}")
+
+        # 9. cmd_discard: draft issue removed atomically (AC-SI-004)
+        # Seed a fresh draft issue + .md file.
+        _save_tasks({
+            "ISSUE-DISCARD-1": {"status": "draft", "updated_at": time.time()},
+        }, target=tmp)
+        dq = _load_queue(target=tmp)
+        dq["draft"].append("ISSUE-DISCARD-1")
+        _save_queue(dq, target=tmp)
+        dpath = os.path.join(_issues_dir(target=tmp), "ISSUE-DISCARD-1.md")
+        _atomic_write_text(dpath, "# ISSUE-DISCARD-1\n")
+        ns = argparse.Namespace(issue_id="ISSUE-DISCARD-1", target=tmp)
+        rc = cmd_discard(ns)
+        if rc != 0:
+            failures.append(f"discard draft should rc=0, got {rc}")
+        t = _load_tasks(target=tmp)
+        if "ISSUE-DISCARD-1" in t:
+            failures.append("discard did not remove issue from tasks.json")
+        qq = _load_queue(target=tmp)
+        if any("ISSUE-DISCARD-1" in qq.get(s, []) for s in QUEUE_STATES):
+            failures.append("discard did not remove issue from all queue states")
+        if os.path.exists(dpath):
+            failures.append("discard did not delete issue .md file")
+
+        # 10. cmd_discard: non-draft issue exits 2 (AC-SI-005)
+        _save_tasks({
+            "ISSUE-DISCARD-2": {"status": "approved", "updated_at": time.time()},
+        }, target=tmp)
+        dq2 = _load_queue(target=tmp)
+        dq2["approved"].append("ISSUE-DISCARD-2")
+        _save_queue(dq2, target=tmp)
+        ns = argparse.Namespace(issue_id="ISSUE-DISCARD-2", target=tmp)
+        rc = cmd_discard(ns)
+        if rc != 2:
+            failures.append(f"discard non-draft should rc=2, got {rc}")
+        if "ISSUE-DISCARD-2" not in _load_tasks(target=tmp):
+            failures.append("discard non-draft mutated tasks.json")
+
+        # 11. cmd_discard: missing issue exits 2
+        ns = argparse.Namespace(issue_id="ISSUE-NOPE", target=tmp)
+        rc = cmd_discard(ns)
+        if rc != 2:
+            failures.append(f"discard missing should rc=2, got {rc}")
+
+        # 12. cmd_discard: run-history defense — draft status but a run log
+        # references the issue -> rc=2, no state change.
+        _save_tasks({
+            "ISSUE-DISCARD-3": {"status": "draft", "updated_at": time.time()},
+        }, target=tmp)
+        dq3 = _load_queue(target=tmp)
+        dq3["draft"].append("ISSUE-DISCARD-3")
+        _save_queue(dq3, target=tmp)
+        _atomic_write_json(
+            os.path.join(_runs_dir(target=tmp), "fakedeadbeef.json"),
+            {"run_id": "fakedeadbeef", "issue_id": "ISSUE-DISCARD-3",
+             "started_at": time.time(), "ended_at": None, "outcome": None,
+             "agent": "dev", "attempt": 1, "evidence": []})
+        ns = argparse.Namespace(issue_id="ISSUE-DISCARD-3", target=tmp)
+        rc = cmd_discard(ns)
+        if rc != 2:
+            failures.append(f"discard with run history should rc=2, got {rc}")
+        if "ISSUE-DISCARD-3" not in _load_tasks(target=tmp):
+            failures.append("discard with run history mutated tasks.json")
+        # cleanup so subsequent lock test isn't polluted
+        os.remove(os.path.join(_runs_dir(target=tmp), "fakedeadbeef.json"))
+
+        # 12b. cmd_discard: malformed runs/*.json must not crash (rc in {0,2}).
+        _save_tasks({
+            "ISSUE-DISCARD-3B": {"status": "draft", "updated_at": time.time()},
+        }, target=tmp)
+        dq3b = _load_queue(target=tmp)
+        dq3b["draft"].append("ISSUE-DISCARD-3B")
+        _save_queue(dq3b, target=tmp)
+        with open(os.path.join(_runs_dir(target=tmp), "bad.json"), "w") as bf:
+            bf.write("{ this is not valid json")
+        ns = argparse.Namespace(issue_id="ISSUE-DISCARD-3B", target=tmp)
+        try:
+            rc = cmd_discard(ns)
+        except Exception as exc:  # noqa: BLE001 - any crash is a failure here
+            failures.append(f"discard crashed on malformed runs json: {exc!r}")
+            rc = -1
+        if rc not in (0, 2):
+            failures.append(f"discard with malformed runs json should rc in (0,2), got {rc}")
+        os.remove(os.path.join(_runs_dir(target=tmp), "bad.json"))
+
+        # 13. cmd_discard: lock contention exits 3
+        ok, _ = acquire_lock(INTAKE_LOCK_ID, target=tmp)
+        if not ok:
+            failures.append("setup acquire INTAKE_LOCK_ID failed")
+        else:
+            _save_tasks({
+                "ISSUE-DISCARD-4": {"status": "draft", "updated_at": time.time()},
+            }, target=tmp)
+            ns = argparse.Namespace(issue_id="ISSUE-DISCARD-4", target=tmp)
+            rc = cmd_discard(ns)
+            if rc != 3:
+                failures.append(f"discard under lock contention should rc=3, got {rc}")
+            if "ISSUE-DISCARD-4" not in _load_tasks(target=tmp):
+                failures.append("discard under contention mutated tasks.json")
+            release_lock(INTAKE_LOCK_ID, target=tmp)
     finally:
         sys.stdout.close()
         sys.stdout = saved_stdout
@@ -1120,6 +1318,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     _add_target_arg(p)
     p.add_argument("issue_id")
     p.set_defaults(func=cmd_unlock)
+
+    p = sub.add_parser("discard", help="Remove a draft issue (atomic, draft-only)")
+    _add_target_arg(p)
+    p.add_argument("issue_id")
+    p.set_defaults(func=cmd_discard)
 
     p = sub.add_parser("selftest", help="Internal sanity checks")
     p.set_defaults(func=lambda a: selftest())
