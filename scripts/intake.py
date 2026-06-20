@@ -52,9 +52,9 @@ def _split_sections(text: str) -> List[Tuple[str, str, int, int]]:
     """Split markdown into (heading, body, start_line, end_line) sections.
 
     A section boundary is a `#` or `##` heading whose stripped title starts with
-    one of _HEADING_KEYWORDS (case-insensitive). If none match, fall back to
-    every `##` heading. If no headings at all, return a single section spanning
-    the whole document.
+    one of _HEADING_KEYWORDS (case-insensitive). If no keyword headings exist,
+    the whole document becomes a single section (whole-doc Background). If no
+    headings at all, same single-section result.
     """
     lines = text.splitlines()
     n = len(lines)
@@ -80,9 +80,10 @@ def _split_sections(text: str) -> List[Tuple[str, str, int, int]]:
     if explicit:
         chosen = explicit
     else:
-        # Fall back to every level-2 heading.
-        l2 = [(i, lv, t) for (i, lv, t) in headings if lv == 2]
-        chosen = l2 if l2 else headings
+        # No keyword-headed sections: treat the whole document as a single
+        # issue (whole-doc Background). Do NOT split on every ## — that
+        # produced one junk issue per generic boilerplate section (AC-SI-001).
+        return [("(untitled)", "\n".join(lines), 0, max(n - 1, 0))]
 
     out: List[Tuple[str, str, int, int]] = []
     for idx, (start, _lv, title) in enumerate(chosen):
@@ -127,11 +128,21 @@ def _extract_background(body: str) -> str:
     return " ".join(para) if para else "TBD"
 
 
+def _strip_bullet(line: str) -> str:
+    """Strip a leading markdown bullet marker (-, *, or `N.`) from a line."""
+    s = line.strip()
+    s = re.sub(r"^(?:[-*+]|\d+\.)\s+", "", s)
+    return s.strip()
+
+
 def _extract_scope(body: str) -> Tuple[str, str]:
     """Return (in_scope, out_of_scope) as semicolon-joined bullets.
 
     Recognizes both markdown headings (## In Scope) and plain-text labels
-    (In Scope: or In Scope on its own line).
+    (In Scope: or In Scope on its own line). Falls back to a `### Scope`
+    heading containing `**In Scope:**` / `**Out of Scope:**` bold-label
+    sub-bullets (the PRD task-section pattern) when the primary path finds
+    nothing (AC-SI-002).
     """
     in_re = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?In Scope\s*:?\s*$")
     out_re = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?Out of Scope\s*:?\s*$")
@@ -149,14 +160,68 @@ def _extract_scope(body: str) -> Tuple[str, str]:
         chunk = sub[:end.start()] if end else sub
         bullets = []
         for line in chunk.splitlines():
-            s = line.strip().lstrip("-*").strip()
+            s = _strip_bullet(line)
             if s:
                 bullets.append(s)
         return bullets
 
-    in_scope = _block(in_re) or ["TBD"]
-    out_scope = _block(out_re) or ["TBD"]
+    in_scope = _block(in_re)
+    out_scope = _block(out_re)
+    # Backward-compat: if primary path found both, return immediately so the
+    # h3 fallback cannot shadow existing h2/bare-label forms (AC-SI-005).
+    if in_scope and out_scope:
+        return "; ".join(in_scope), "; ".join(out_scope)
+    # h3 fallback: `### Scope` heading with `**In Scope:**` / `**Out of Scope:**`
+    # bold-label sub-bullets inside (AC-SI-002).
+    if not in_scope or not out_scope:
+        h3_in, h3_out = _extract_scope_h3(body)
+        if not in_scope and h3_in:
+            in_scope = h3_in
+        if not out_scope and h3_out:
+            out_scope = h3_out
+    in_scope = in_scope or ["TBD"]
+    out_scope = out_scope or ["TBD"]
     return "; ".join(in_scope), "; ".join(out_scope)
+
+
+def _extract_scope_h3(body: str) -> Tuple[List[str], List[str]]:
+    """Parse a `### Scope` (or `## Scope`) heading block with bold-label
+    `**In Scope:**` / `**Out of Scope:**` sub-bullets (AC-SI-002).
+
+    Returns (in_bullets, out_bullets); empty lists when absent.
+    """
+    scope_head = re.compile(r"(?im)^\s*#{1,6}\s*Scope\s*:?\s*$")
+    m = scope_head.search(body)
+    if not m:
+        return [], []
+    sub = body[m.end():]
+    # Block ends at the next peer heading (Acceptance Criteria, Risk, etc.).
+    end_re = re.compile(
+        r"(?im)^\s*#{1,6}\s*(?:Acceptance Criteria|AC|Acceptance|Technical Notes|Test Requirements|Risk|Dependencies|Background)\s*:?\s*$"
+    )
+    end = end_re.search(sub)
+    chunk = sub[:end.start()] if end else sub
+
+    in_label = re.compile(r"(?im)^\s*\*{2}\s*In Scope\s*:\s*\*{2}\s*$")
+    out_label = re.compile(r"(?im)^\s*\*{2}\s*Out of Scope\s*:\s*\*{2}\s*$")
+
+    def _bullets_after(label_re: "re.Pattern[str]", text: str) -> List[str]:
+        lm = label_re.search(text)
+        if not lm:
+            return []
+        rest = text[lm.end():]
+        # Bullets end at the next bold label or at any heading line.
+        stop = re.compile(r"(?im)^\s*(?:\*{2}\s*(?:In Scope|Out of Scope)\s*:\s*\*{2}|#{1,6}\s)")
+        sm = stop.search(rest)
+        segment = rest[:sm.start()] if sm else rest
+        bullets = []
+        for line in segment.splitlines():
+            s = _strip_bullet(line)
+            if s:
+                bullets.append(s)
+        return bullets
+
+    return _bullets_after(in_label, chunk), _bullets_after(out_label, chunk)
 
 
 def _extract_depends_on(body: str) -> List[str]:
@@ -192,8 +257,9 @@ def _extract_acceptance(body: str) -> List[str]:
     ac_head = re.compile(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:Acceptance Criteria|AC|Acceptance)\s*:?\s*$"
     )
+    # A block ends at the next heading line OR at a recognized peer label.
     stop_re = re.compile(
-        r"(?im)^\s*(?:#{1,6}\s*)?(?:In Scope|Out of Scope|Acceptance Criteria|AC|Acceptance|Technical Notes|Test Requirements|Risk)\s*:?\s*$"
+        r"(?im)^\s*(?:#{1,6}\s+.+|(?:#{1,6}\s*)?(?:In Scope|Out of Scope|Acceptance Criteria|AC|Acceptance|Technical Notes|Test Requirements|Risk)\s*:?\s*)$"
     )
     m = ac_head.search(body)
     if not m:
@@ -203,7 +269,7 @@ def _extract_acceptance(body: str) -> List[str]:
     chunk = sub[:end.start()] if end else sub
     bullets = []
     for line in chunk.splitlines():
-        s = line.strip().lstrip("-*").strip()
+        s = _strip_bullet(line)
         if s:
             bullets.append(s)
     return bullets
@@ -618,6 +684,95 @@ def selftest() -> int:
         if rc == 0:
             failures.append("intake on uninitialized repo should return non-zero")
         shutil.rmtree(tmp_repo3, ignore_errors=True)
+
+        # --- Case 5: no-keyword PRD with multiple ## sections -> ONE issue -
+        # AC-SI-001: when no ## <Keyword>: headings exist, the fallback must
+        # NOT split on every ##; it returns a single whole-doc issue.
+        tmp_repo5 = tempfile.mkdtemp(prefix="laplace-intake-selftest5-")
+        state.cmd_init(target=tmp_repo5)
+        prd5 = os.path.join(tmp_repo5, "nokeyword.md")
+        with open(prd5, "w", encoding="utf-8") as f:
+            f.write(
+                "# Some PRD\n\n"
+                "Intro line that should land in Background.\n\n"
+                "## Status\n\nStatus text here.\n\n"
+                "## Background\n\nMore background prose.\n\n"
+                "## Problem\n\nProblem statement.\n\n"
+                "## Goals\n\nGoal bullet list.\n"
+            )
+        rc = cmd_intake(prd5, target=tmp_repo5)
+        if rc != 0:
+            failures.append(f"intake(nokeyword) returned {rc}")
+        files5 = glob.glob(os.path.join(state._issues_dir(tmp_repo5), "ISSUE-*.md"))
+        if len(files5) != 1:
+            failures.append(
+                f"Case5 no-keyword PRD should yield 1 issue, got {len(files5)}: {files5}"
+            )
+        else:
+            with open(files5[0], "r", encoding="utf-8") as f:
+                c5 = f.read()
+            # Whole-doc body should be the Background; both generic headings
+            # absorbed into the single issue, not split.
+            if "Status text here" not in c5 or "Problem statement" not in c5:
+                failures.append("Case5 single issue did not absorb whole-doc body")
+        shutil.rmtree(tmp_repo5, ignore_errors=True)
+
+        # --- Case 6: ## Task: with ### Scope (bold labels) + ### AC ---------
+        # AC-SI-002: h3 Scope with **In Scope:**/**Out of Scope:** bold-label
+        # sub-bullets and ### Acceptance Criteria (numbered) populate Scope/AC.
+        tmp_repo6 = tempfile.mkdtemp(prefix="laplace-intake-selftest6-")
+        state.cmd_init(target=tmp_repo6)
+        prd6 = os.path.join(tmp_repo6, "task.md")
+        # Embed a fake token inside an ### Acceptance Criteria bullet to
+        # verify redaction still applies to the h3 AC path (AC-SI-004).
+        token6 = "y" * 28
+        with open(prd6, "w", encoding="utf-8") as f:
+            f.write(
+                "# Widget Parser PRD\n\n"
+                "## Task: H3 scope extraction\n\n"
+                "Task body describing the parser fix.\n\n"
+                "### Scope\n\n"
+                "**In Scope:**\n"
+                "- `scripts/intake.py` h3 Scope path\n"
+                "- `scripts/intake.py` h3 AC path\n\n"
+                "**Out of Scope:**\n"
+                "- Changing keyword set\n"
+                "- Multi-level outline inference\n\n"
+                "### Acceptance Criteria\n"
+                f"1. AC-A: h3 Scope populates In/Out bullets\n"
+                f"2. AC-B: api_key: {token6} must be redacted\n"
+                f"3. AC-C: h3 AC bullets populate field\n\n"
+                "### Risk / Release Impact\n\n"
+                "- Risk Level: medium\n"
+            )
+        rc = cmd_intake(prd6, target=tmp_repo6)
+        if rc != 0:
+            failures.append(f"intake(task6) returned {rc}")
+        files6 = glob.glob(os.path.join(state._issues_dir(tmp_repo6), "ISSUE-*.md"))
+        if len(files6) != 1:
+            failures.append(f"Case6 should yield 1 issue, got {len(files6)}")
+        else:
+            with open(files6[0], "r", encoding="utf-8") as f:
+                c6 = f.read()
+            if "h3 Scope path" not in c6:
+                failures.append("Case6 In Scope bullet (h3 Scope path) missing")
+            if "Changing keyword set" not in c6:
+                failures.append("Case6 Out of Scope bullet (keyword set) missing")
+            if "AC-A" not in c6:
+                failures.append("Case6 Acceptance Criteria bullet (AC-A) missing")
+            if "AC-C" not in c6:
+                failures.append("Case6 Acceptance Criteria bullet (AC-C) missing")
+            # Scope/AC must be populated, not TBD.
+            scope_block = c6.split("## Scope", 1)[1].split("## Acceptance Criteria", 1)[0]
+            if "TBD" in scope_block:
+                failures.append("Case6 Scope rendered TBD despite h3 Scope present")
+            ac_block = c6.split("## Acceptance Criteria", 1)[1].split("## Technical Notes", 1)[0]
+            if "TBD" in ac_block:
+                failures.append("Case6 AC rendered TBD despite h3 AC present")
+            # AC-SI-004: embedded fake token must be redacted.
+            if token6 in c6:
+                failures.append("Case6 leaked token from h3 AC bullet (redaction regression)")
+        shutil.rmtree(tmp_repo6, ignore_errors=True)
 
         # --- AC-LP-005 spot check: all required semantic fields -------------
         sample_path = os.path.join(issues_dir, "ISSUE-0001.md")
