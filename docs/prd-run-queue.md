@@ -221,22 +221,22 @@ User-facing entry point. Command wraps the skill like the other laplace commands
 
 ## Task: Status integration for queue runs
 
-`/laplace:status` reports active queue runs.
+`/laplace:status` reports resumable queue runs. (Synchronous semantics: a queue run is never live between invocations — "resumable" means halted at a `merge-` gate awaiting human merge/resolution, not an active background process.)
 
 ### Background
 Humans need visibility into where the queue runner is: current issue, position, merge policy, consecutive counter.
 
 ### Scope
 **In Scope:**
-- `state.py status` detects active queue run and emits: parent run id, current issue, position/total, merge policy, consecutive count.
+- `state.py status` detects resumable queue run and emits: parent run id, current issue, position/total, merge policy, consecutive count.
 - `commands/status.md` passes through verbatim.
 
 **Out of Scope:**
 - Live progress UI.
 
 ### Acceptance Criteria
-- AC-QR-018-status: active queue run shows all five fields.
-- AC-QR-019-status: no active queue run → existing single-issue status unchanged.
+- AC-QR-018-status: resumable queue run shows all five fields.
+- AC-QR-019-status: no resumable queue run → existing single-issue status unchanged.
 - Characterization tests.
 
 ### Risk / Release Impact
