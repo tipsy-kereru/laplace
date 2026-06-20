@@ -28,7 +28,10 @@ if HERE not in sys.path:
 import state  # noqa: E402
 
 # Lock ID for the ID-allocation critical section (sequential numbering).
-_INTAKE_LOCK_ID = "ISSUE-INTAKE"
+# Single source of truth: state.INTAKE_LOCK_ID (imported here so intake and
+# discard share the same lock and cannot race). state.py must not import
+# intake (would create a circular dependency).
+_INTAKE_LOCK_ID = state.INTAKE_LOCK_ID
 
 # Heading prefix keywords that look like work-unit boundaries.
 _HEADING_KEYWORDS = ("feature", "task", "requirement", "story", "epic", "issue")
