@@ -71,6 +71,7 @@ Workflow:
    - The issue file path (`.harness/issues/<issue-id>.md`)
    - The run id (so the agent can append evidence)
    - The branch name (`laplace/<issue-id>`)
+   - The commit instruction: after capturing test evidence and before reporting `ready-for-review`, commit all working-tree changes on `laplace/<issue-id>` with a conventional-commit message referencing the issue id (mandatory unless `BRANCH_SKIPPED` or policy denies `git commit` — record the reason and proceed)
    - Constraints: stay within issue scope, honor policy deny list, do not exceed `max_files_changed_without_approval` / `max_diff_lines_without_approval`
 
 3. The dev agent runs the project's test command and captures output. Before the run can transition to `review`, test evidence MUST be recorded:
@@ -79,7 +80,13 @@ Workflow:
    python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py evidence <run-id> test <test-output-path>
    ```
 
-4. Transition to review:
+4. Commit dev changes on the issue branch (mandatory; AC-SI-007). After test evidence is captured and BEFORE advancing to `review`, the dev agent commits all working-tree changes on `laplace/<issue-id>` with a conventional-commit message referencing the issue id (e.g. `feat(<area>): <summary> (ISSUE-<id>)`). The advance to `review` MUST NOT happen with a dirty tree — the review agent diffs the branch HEAD against the base, so an uncommitted change is invisible to review and surfaces as an empty-diff `needs-fix`.
+
+   Fail-safe (matches the existing branch-skip philosophy): if the working directory is not a git repo, the run was started with `BRANCH_SKIPPED`, or `git commit` is denied by policy, the dev agent records the reason in its summary and proceeds. The orchestrator does NOT hand-commit on the agent's behalf.
+
+   Note: the orchestrator's spawn prompt to the dev agent MUST include this commit instruction. The instruction is codified in the dev agent contract (`agents/laplace-dev-agent.md`); the orchestrator copies it into the spawn prompt verbatim.
+
+5. Transition to review:
 
    ```
    python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py advance <issue-id> in-progress review --summary "<dev complete; tests captured>"

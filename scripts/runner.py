@@ -1243,6 +1243,63 @@ def selftest() -> int:
             failures.append(
                 f"security-check ISSUE-0006+workflow diff should trigger; "
                 f"got: {cap.getvalue()!r}")
+
+        # --- AC-SI-008: dev commit characterization -------------------------
+        # Invariant: after the dev phase, the issue branch HEAD is ahead of
+        # its base (i.e. at least one commit exists on the branch beyond the
+        # base). We simulate the dev agent's commit via subprocess git,
+        # routed through policy.check_command exactly as _setup_branch does.
+        gitrepo = tempfile.mkdtemp(prefix="laplace-runner-git-")
+        try:
+            def _git(args: list) -> subprocess.CompletedProcess:
+                r = subprocess.run(["git", "-C", gitrepo] + args,
+                                   capture_output=True, text=True, timeout=10)
+                return r
+
+            _git(["init", "-q", "--initial-branch=main"])
+            _git(["config", "user.email", "self@test"])
+            _git(["config", "user.name", "selftest"])
+            with open(os.path.join(gitrepo, "README.md"), "w") as f:
+                f.write("base\n")
+            _git(["add", "README.md"])
+            _git(["commit", "-q", "-m", "base"])
+            base_sha = _git(["rev-parse", "main"]).stdout.strip()
+
+            # runner.py _setup_branch equivalent: create the issue branch.
+            binfo = _setup_branch("ISSUE-0007", gitrepo)
+            if binfo.status not in ("created", "reused"):
+                failures.append(
+                    f"AC-SI-008: _setup_branch should create/reuse in git repo, "
+                    f"got {binfo}")
+            # Simulate the dev agent: write a change, route the commit
+            # through policy.check_command (no runner primitive exists).
+            with open(os.path.join(gitrepo, "change.txt"), "w") as f:
+                f.write("dev work\n")
+            commit_cmd = "git add change.txt && git commit -m feat(x): dev (ISSUE-0007)"
+            ok, reason = policy.check_command(commit_cmd)
+            if not ok:
+                failures.append(
+                    f"AC-SI-008: policy denied simulated dev commit: {reason}")
+            else:
+                r = _git(["add", "change.txt"])
+                r2 = _git(["commit", "-q", "-m",
+                           "feat(x): dev (ISSUE-0007)"])
+                if r.returncode != 0 or r2.returncode != 0:
+                    failures.append(
+                        f"AC-SI-008: simulated dev commit failed: "
+                        f"{r.stderr}{r2.stderr}")
+            head_sha = _git(["rev-parse", "HEAD"]).stdout.strip()
+            if head_sha == base_sha:
+                failures.append(
+                    "AC-SI-008: issue branch HEAD equals base after dev commit; "
+                    "review would see an empty diff")
+            # rev-list count of commits on branch not on base must be >= 1.
+            ahead = _git(["rev-list", "--count", f"{base_sha}..HEAD"])
+            if not (ahead.returncode == 0 and int(ahead.stdout.strip() or "0") >= 1):
+                failures.append(
+                    f"AC-SI-008: branch not ahead of base after dev: {ahead.stdout}")
+        finally:
+            shutil.rmtree(gitrepo, ignore_errors=True)
     finally:
         sys.stdout.close()
         sys.stderr.close()
