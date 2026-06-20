@@ -38,7 +38,8 @@ You are invoked by the `run` skill during the dev phase. You do NOT transition i
 
    If the test output is in your terminal only (no file), pipe it to a temp file under `/tmp` first, then pass the path. Raw command output is never stored verbatim — `runner.py evidence` reads, redacts, and caps at 1000 chars.
 
-7. Decide:
+7. Commit all changes on `laplace/<issue-id>` with a conventional-commit message that references the issue id (e.g. `feat(<area>): <summary> (ISSUE-<id>)`). Stage only the files you changed — do NOT `git add -A` unless the issue explicitly requires it. Route the commit through the same policy layer as every other command. Skip the commit and record the reason in your summary only if `BRANCH_SKIPPED` was recorded for this run or policy denies `git commit`.
+8. Decide:
    - `ready-for-review`: AC met, tests captured (or manual evidence with rationale).
    - `blocked`: scope ambiguity, missing dependency, test infra unavailable, change exceeds `max_files_changed_without_approval` / `max_diff_lines_without_approval`, or policy denies a required command.
 
@@ -60,6 +61,7 @@ Blocker: <reason, only if Decision=blocked>
 ## Hard Constraints
 
 - MUST capture test evidence (`runner.py evidence <run> test <path>`) before reporting `ready-for-review`. Without it the orchestrator cannot transition to `review-passed` (AC-LP-008 enforced in `runner.py advance`).
+- MUST commit all dev changes to the issue branch (`laplace/<issue-id>`) before reporting `ready-for-review`. Without a commit, the review agent sees an empty diff (branch HEAD equals base) and returns `needs-fix`, forcing a wasted fix round.
 - MUST NOT touch paths in SPEC-002 §Prohibited by Default (`.env*`, `secrets/**`, `.ssh/**`, `.aws/**`, credential stores, browser profiles, keychains, password-manager exports).
 - MUST NOT run `sudo`, `ssh`, `scp`, `aws *`, `gcloud *`, `kubectl *`, `curl * | sh`, `wget * | sh`, `chmod 777`, destructive `rm`. Policy deny list is enforced by PreToolUse.
 - MUST NOT install dependencies, add MCP servers, push, create PRs, or send messages. These require human approval and are out of dev-phase scope.
@@ -74,3 +76,4 @@ Blocker: <reason, only if Decision=blocked>
 - Policy denies a needed command: do NOT bypass. Return `blocked` with the denied command and reason.
 - Scope larger than expected: return `blocked` rather than expanding scope unilaterally.
 - Branch dirty / merge conflict: return `blocked`; do not force anything.
+- Not a git repo / `BRANCH_SKIPPED` / `git commit` policy-denied: record the reason in the summary and still return `ready-for-review` if AC is otherwise demonstrably met (fail-safe). The orchestrator does not hand-commit; the commit is the dev agent's responsibility only when a branch exists.
