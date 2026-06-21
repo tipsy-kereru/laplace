@@ -378,6 +378,50 @@ def _record_child_run(run_id: str, child_run_id: str,
     state._atomic_write_json(path, log)
 
 
+def _merge_resolved_issues(target: Optional[str]) -> set:
+    """Issue ids already recorded as a ``queue_step`` ``from_issue`` across
+    all queue run logs. Such an issue has already passed the merge gate (its
+    branch was merged or auto-merged) and advanced to a successor."""
+    resolved = set()
+    runs_dir = state._runs_dir(target)
+    if not os.path.isdir(runs_dir):
+        return resolved
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = state._read_json(os.path.join(runs_dir, name), default=None)
+        if not isinstance(log, dict) or log.get("kind") != "queue":
+            continue
+        for step in (log.get("queue_steps") or []):
+            fid = step.get("from_issue")
+            if isinstance(fid, str) and fid:
+                resolved.add(fid)
+    return resolved
+
+
+def _pending_merge_gates(target: Optional[str]) -> List[str]:
+    """Review-passed issues whose merge state is not yet resolved.
+
+    ISSUE-0001: in the externally-driven production flow, an issue reaches
+    ``review-passed`` between ``queue_runner.start`` invocations. Such an
+    issue has left the ``approved`` queue (terminal) and is therefore
+    invisible to the main loop, which only processes the approved head. This
+    helper surfaces those issues so a pre-pass can apply
+    ``_handle_merge_policy`` before the next approved issue starts.
+
+    Returns ids in ascending order (R-2: earliest unresolved first).
+    """
+    tasks = state._load_tasks(target)
+    review_passed = sorted(
+        iid for iid, meta in tasks.items()
+        if isinstance(meta, dict) and meta.get("status") == "review-passed"
+    )
+    if not review_passed:
+        return []
+    resolved = _merge_resolved_issues(target)
+    return [iid for iid in review_passed if iid not in resolved]
+
+
 # ---------------------------------------------------------------------------
 # Per-issue processing
 # ---------------------------------------------------------------------------
@@ -551,10 +595,6 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
     _create_parent_log(queue_run_id, start_issue, config, target)
 
     approved = _approved_queue(target)
-    if not approved:
-        _finalize_parent_log(queue_run_id, "noop-empty-queue", target)
-        print(f"queue: no approved issues; nothing to do")
-        return queue_run_id, EXIT_OK
 
     if start_issue is not None:
         if start_issue not in approved:
@@ -568,6 +608,51 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
 
     max_queue_run = config["max_queue_run"]
     consecutive = 0  # issues that reached a terminal state in this run
+
+    # Merge-gate pre-pass (ISSUE-0001). In the externally-driven production
+    # flow, a prior issue may have reached review-passed between
+    # queue_runner invocations. _handle_merge_policy must run on each such
+    # unresolved issue before the approved head starts (or before the
+    # empty-queue noop fires); otherwise the gate is dead code -- the main
+    # loop only sees the approved head, never the just-completed
+    # predecessor, and a resume into an exhausted queue silently noops past
+    # an unmerged branch. Idempotent with the issue_driver selftest flow:
+    # at call start there, all queue issues are still in `approved`, so
+    # _pending_merge_gates returns [] and the in-loop _decide path retains
+    # sole ownership of the gate (AC-MG-005).
+    merge_policy_cfg = config.get("merge_policy", "wait-for-human-merge")
+    gates_resolved = False
+    for gate_id in _pending_merge_gates(target):
+        if policy_override is not None:
+            decision, reason_token = policy_override(gate_id, target)
+        else:
+            decision, reason_token = _handle_merge_policy(
+                gate_id, target, queue_run_id, merge_policy_cfg)
+        if decision == "halt":
+            outcome = f"{reason_token}:{gate_id}"
+            _finalize_parent_log(queue_run_id, outcome, target)
+            print(f"queue halted: {outcome}")
+            return queue_run_id, EXIT_OK
+        # decision == "advance": record the N -> (approved head | "") step.
+        # Under auto-merge-branch, _handle_merge_policy already created the
+        # integration-branch merge; under wait-for-human-merge, the human
+        # merged the branch between invocations.
+        next_after_gate = approved[idx] if idx < len(approved) else ""
+        _append_queue_step(queue_run_id, gate_id, next_after_gate,
+                           "review-passed",
+                           _read_issue_run_id(gate_id, target) or "",
+                           target)
+        gates_resolved = True
+
+    if not approved:
+        # If the pre-pass just cleared a gate, the queue is genuinely
+        # exhausted (all known work consumed). Only the truly idle case
+        # (no gates, no approved) is a no-op.
+        outcome = "queue-exhausted" if gates_resolved else "noop-empty-queue"
+        _finalize_parent_log(queue_run_id, outcome, target)
+        print("queue: exhausted" if gates_resolved
+              else "queue: no approved issues; nothing to do")
+        return queue_run_id, EXIT_OK
 
     while idx < len(approved):
         issue_id = approved[idx]

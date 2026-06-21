@@ -250,13 +250,164 @@ def test_two_issue_queue_resume_after_gate_clears():
         _merge_issue_branch_into_base("ISSUE-B", "main", repo)
         assert queue_runner._issue_branch_is_merged("ISSUE-B", repo) is True
 
-        # Re-invoke the queue. The approved list is empty (both terminal) ->
-        # noop-empty-queue (the queue is effectively exhausted of pending
-        # work). Exit code is 0 (clean no-op, not an error halt).
+        # Re-invoke the queue. ISSUE-0001 fix: the merge-gate pre-pass now
+        # resolves ISSUE-B (its branch was just merged by the human), records
+        # a B -> "" queue_step, and the main loop finds the approved queue
+        # empty -> queue-exhausted. (Pre-fix this was `noop-empty-queue`
+        # because the gate never fired on resume; the gate was the bug.)
         rid2, rc2 = queue_runner._run_queue(None, repo, cfg, driver_a)
         assert rc2 == 0
         log2 = _log(repo, rid2)
-        assert log2["outcome"] == "noop-empty-queue", log2["outcome"]
-        assert log2["queue_steps"] == []
+        assert log2["outcome"] == "queue-exhausted", log2["outcome"]
+        steps2 = log2["queue_steps"]
+        assert len(steps2) == 1, steps2
+        assert steps2[0]["from_issue"] == "ISSUE-B"
+        assert steps2[0]["to_issue"] == ""
+        assert steps2[0]["from_terminal_state"] == "review-passed"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-0001: merge-policy gate reachable in the production flow
+# (no issue_driver; phases driven externally between _run_queue invocations)
+# ---------------------------------------------------------------------------
+
+def _drive_to_review_passed_with_commit(issue_id, target):
+    """Production-sim: add a distinct commit to laplace/<issue_id> then drive
+    pm-review -> review-passed. Models the skill driving phases externally
+    (no issue_driver callback)."""
+    marker = f"{issue_id}.txt"
+    with open(os.path.join(target, marker), "w") as f:
+        f.write(f"{issue_id}\n")
+    _git(["add", marker], target)
+    _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+    return _drive_to_review_passed(issue_id, target)
+
+
+def test_production_flow_mergewait_gate_halt_then_advance():
+    """AC-MG-001 / AC-MG-002: no issue_driver.
+
+    Call 1: start -> ISSUE-A approved->pm-review, halts non-terminal
+            (skill drives phases externally between invocations).
+    Externally drive ISSUE-A to review-passed (commit on its branch).
+    Call 2: pre-pass sees ISSUE-A review-passed + unmerged -> halt
+            merge-wait:ISSUE-A. ISSUE-B must NOT be started.
+    Human merges ISSUE-A's branch into base.
+    Call 3: pre-pass resolves ISSUE-A (merged) -> records queue_step A->B,
+            main loop starts ISSUE-B (pm-review). AC-MG-002.
+    """
+    repo = _make_repo("main")
+    try:
+        assert state.cmd_init(target=repo) == 0
+        cfg = state.load_config(repo)
+        _seed_approved(repo, "ISSUE-A")
+        _seed_approved(repo, "ISSUE-B")
+
+        # Call 1: no driver -> ISSUE-A started, non-terminal halt.
+        rid1, rc1 = queue_runner._run_queue(None, repo, cfg, None)
+        assert rc1 != 0, "non-terminal halt should be non-zero"
+        log1 = _log(repo, rid1)
+        assert log1["outcome"].startswith("non-terminal"), log1["outcome"]
+        assert state._load_tasks(repo)["ISSUE-A"]["status"] == "pm-review"
+
+        # Externally drive ISSUE-A to review-passed (with a branch commit so
+        # merge detection is meaningful).
+        _drive_to_review_passed_with_commit("ISSUE-A", repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-A", repo) is False
+
+        # Call 2: pre-pass halts merge-wait:ISSUE-A; ISSUE-B untouched.
+        rid2, rc2 = queue_runner._run_queue(None, repo, cfg, None)
+        assert rc2 == 0, "merge-wait halt should exit 0"
+        log2 = _log(repo, rid2)
+        assert log2["outcome"] == "merge-wait:ISSUE-A", log2["outcome"]
+        assert log2["queue_steps"] == [], log2["queue_steps"]
+        assert state._load_tasks(repo)["ISSUE-B"]["status"] == "approved"
+
+        # AC-MG-006: /laplace:status surfaces the merge-wait halt.
+        status_out = state._format_status(repo)
+        assert "Queue run:" in status_out
+        assert "ISSUE-A" in status_out
+
+        # Human merges ISSUE-A's branch into base.
+        _merge_issue_branch_into_base("ISSUE-A", "main", repo)
+        assert queue_runner._issue_branch_is_merged("ISSUE-A", repo) is True
+
+        # Call 3: pre-pass resolves ISSUE-A (queue_step A->B), starts ISSUE-B.
+        rid3, rc3 = queue_runner._run_queue(None, repo, cfg, None)
+        log3 = _log(repo, rid3)
+        steps3 = log3["queue_steps"]
+        assert len(steps3) == 1, steps3
+        assert steps3[0]["from_issue"] == "ISSUE-A"
+        assert steps3[0]["to_issue"] == "ISSUE-B"
+        assert steps3[0]["from_terminal_state"] == "review-passed"
+        # ISSUE-B was started by the main loop (advanced past the gate).
+        assert state._load_tasks(repo)["ISSUE-B"]["status"] == "pm-review"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_production_flow_auto_merge_branch_gate():
+    """AC-MG-003: merge_policy=auto-merge-branch. Pre-pass triggers the
+    integration-branch merge (laplace/queue-<queue_run_id>) for a
+    review-passed predecessor instead of skipping the gate."""
+    repo = _make_repo("main")
+    try:
+        assert state.cmd_init(target=repo) == 0
+        cfg_am = {"max_queue_run": 5, "merge_policy": "auto-merge-branch"}
+        _seed_approved(repo, "ISSUE-A")
+        _seed_approved(repo, "ISSUE-B")
+
+        # Call 1: start ISSUE-A (non-terminal halt, no driver).
+        rid1, _ = queue_runner._run_queue(None, repo, cfg_am, None)
+        _drive_to_review_passed_with_commit("ISSUE-A", repo)
+
+        # Call 2: pre-pass auto-merges ISSUE-A into laplace/queue-<rid2>,
+        # records queue_step A->B, main loop starts ISSUE-B.
+        rid2, rc2 = queue_runner._run_queue(None, repo, cfg_am, None)
+        log2 = _log(repo, rid2)
+        # ISSUE-A was started in call 1; its branch carries the commit ->
+        # clean --no-ff merge into the fresh integration branch -> advance.
+        assert any(s["from_issue"] == "ISSUE-A" and s["to_issue"] == "ISSUE-B"
+                   for s in log2["queue_steps"]), log2["queue_steps"]
+        # Integration branch created with ISSUE-A's work merged.
+        integ = queue_runner._integration_branch_name(rid2)
+        r_int = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", integ],
+            capture_output=True)
+        assert r_int.returncode == 0, "integration branch missing"
+        assert os.path.exists(os.path.join(repo, "ISSUE-A.txt")), \
+            "ISSUE-A work missing on integration branch"
+        # ISSUE-B was started.
+        assert state._load_tasks(repo)["ISSUE-B"]["status"] == "pm-review"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_pending_merge_gates_excludes_resolved():
+    """Unit guard for _pending_merge_gates: an issue already recorded as a
+    queue_step from_issue is not re-gated (prevents double-gating across
+    resume calls)."""
+    repo = _make_repo("main")
+    try:
+        assert state.cmd_init(target=repo) == 0
+        _seed_approved(repo, "ISSUE-A")
+        # Place ISSUE-A in review-passed directly.
+        tasks = state._load_tasks(repo)
+        tasks["ISSUE-A"]["status"] = "review-passed"
+        state._save_tasks(tasks, target=repo)
+        assert queue_runner._pending_merge_gates(repo) == ["ISSUE-A"]
+        # Simulate a recorded queue_step resolving ISSUE-A.
+        rid = "gateunit-1"
+        log_path = os.path.join(state._runs_dir(repo), f"{rid}.json")
+        state._atomic_write_json(log_path, {
+            "run_id": rid, "kind": "queue", "queue_steps": [
+                {"from_issue": "ISSUE-A", "to_issue": "ISSUE-B",
+                 "from_terminal_state": "review-passed",
+                 "evidence_run_id": "x"}],
+            "started_at": time.time(), "ended_at": time.time(),
+            "outcome": "queue-exhausted",
+        })
+        assert queue_runner._pending_merge_gates(repo) == []
     finally:
         shutil.rmtree(repo, ignore_errors=True)

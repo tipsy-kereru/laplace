@@ -398,10 +398,11 @@ def test_queue_halt_merge_wait_then_resume_advances():
         _git(["merge", "-q", "--no-ff", "laplace/ISSUE-A", "-m", "merge A"], repo)
         assert queue_runner._issue_branch_is_merged("ISSUE-A", repo) is True
 
-        # Second run: ISSUE-A is review-passed (terminal) and was removed
-        # from `approved` by _set_issue_state, so the queue resumes at
-        # ISSUE-B. No queue_step is recorded in this run (ISSUE-A was not
-        # processed here); the resume is implicit via the approved-list drop.
+        # Second run (ISSUE-0001 fix): the merge-gate pre-pass sees ISSUE-A
+        # review-passed + now-merged, records the A -> B queue_step, then
+        # the main loop starts ISSUE-B whose branch is unmerged -> halt
+        # merge-wait:ISSUE-B. (Pre-fix this run recorded no queue_step
+        # because the gate never fired on resume -- the gate was the bug.)
         q_after = state._load_queue(repo)
         assert "ISSUE-A" not in q_after.get("approved", [])
         assert "ISSUE-B" in q_after.get("approved", [])
@@ -410,7 +411,11 @@ def test_queue_halt_merge_wait_then_resume_advances():
         assert rc2 == 0
         log2 = _log(repo, rid2)
         assert log2["outcome"] == "merge-wait:ISSUE-B", log2["outcome"]
-        assert log2["queue_steps"] == []
+        steps2 = log2["queue_steps"]
+        assert len(steps2) == 1, steps2
+        assert steps2[0]["from_issue"] == "ISSUE-A"
+        assert steps2[0]["to_issue"] == "ISSUE-B"
+        assert steps2[0]["from_terminal_state"] == "review-passed"
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
