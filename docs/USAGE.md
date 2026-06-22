@@ -262,6 +262,7 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 | `/laplace:doctor` | After install, after upgrade, when something behaves oddly |
 | `/laplace:init` | Once per project |
 | `/laplace:intake <prd>` | Have a PRD/story ready to convert |
+| `/laplace:verify [prd]` | After intake, before approve — catch TBD fields, coverage gaps, broken refs |
 | `/laplace:approve <issue>` | You reviewed a draft and want it in the queue |
 | `/laplace:discard <issue>` | A draft was created by mistake and should not exist (draft-only) |
 | `/laplace:run [issue]` | Execute or resume a loop |
@@ -281,6 +282,17 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 - **Reports are sanitized.** Secrets are redacted before persistence; safe to paste.
 - **Approvals are auditable.** Every `approve` appends to `.harness/state/approvals.jsonl` with a timestamp.
 - **Policy cannot be weakened.** If the loop refuses something (force-push, secret read, curl-pipe-sh), that is the hard safety floor, not a bug.
+
+### Use case — Verify before approve
+
+Intake is mechanical; it can produce TBD fields, mis-parsed subheadings, or PRD coverage gaps. Run `/laplace:verify docs/prd-X.md` after intake and before approve to surface these in one read-only pass:
+
+- Per-issue PASS/WARN/FAIL table (TBD fields, broken `Source.Section`, AC traceability gaps).
+- PRD coverage matrix — every `## Task:` section mapped to an issue, or flagged `ORPHAN`.
+- Cross-issue — broken `depends_on` refs and duplicate AC (>80% overlap, warn).
+
+Verify does NOT transition state and does NOT block `/laplace:approve`. It is advisory; the human still owns the approve gate for scope/risk judgment. Exit codes: `0` clean or warn-only / `1` any fail / `2` usage error.
+
 
 ---
 
