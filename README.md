@@ -279,6 +279,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:init` | Initialize `.harness/` runtime workspace |
 | `/laplace:doctor` | Check plugin, hooks, config, test commands, Moon Cell profile |
 | `/laplace:intake <prd>` | Convert PRD/story into local draft issues |
+| `/laplace:verify [prd]` | Check draft issues against the PRD (coverage, fields, traceability) |
 | `/laplace:approve <issue>` | Move draft issue to approved queue |
 | `/laplace:discard <issue>` | Remove a draft issue (atomic, draft-only) |
 | `/laplace:run [issue]` | Execute one issue loop |
