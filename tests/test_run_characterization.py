@@ -203,7 +203,11 @@ def test_single_issue_run_log_shape_unchanged():
 
         # Expected key -> value type contract. `kind` is absent on single-issue
         # run logs (only queue parent logs carry kind=="queue"); its absence is
-        # itself part of the characterization.
+        # itself part of the characterization. `worktree_path` is hoisted to
+        # top-level (ISSUE-0002 / AC-WT-009); it is None in this non-repo
+        # harness (BRANCH_SKIPPED) and a str when a worktree was created.
+        # `worktree_teardown` is recorded by `runner.cmd_end` after teardown
+        # ("removed" | "dirty-halt" | "skipped").
         expected = {
             "run_id": str,
             "issue_id": str,
@@ -215,6 +219,8 @@ def test_single_issue_run_log_shape_unchanged():
             "evidence": list,
             "transitions": list,
             "branch": dict,
+            "worktree_path": type(None),
+            "worktree_teardown": str,
         }
         assert set(log.keys()) == set(expected.keys()), \
             f"run log keys drifted: {set(log.keys())} != {set(expected.keys())}"

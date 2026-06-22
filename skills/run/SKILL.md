@@ -27,12 +27,12 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py start <issue-id>
 
 - Validates the issue is in `approved` state.
 - Acquires the issue lock (held until `runner.py end`).
-- Creates an isolated branch `laplace/<issue-id>` via `git checkout -b`. If the branch already exists, reuses it (idempotent). If the working directory is not a git repo (or git is unavailable), records `BRANCH_SKIPPED:not-a-git-repo` in the run log and proceeds with state transitions only — fail-safe, never crashes.
-- Creates the run log at `.harness/state/runs/<run-id>.json`.
+- Creates a per-issue git worktree at `.harness/worktrees/<issue-id>/` on branch `laplace/<issue-id>` (branched from `main`, falling back to `master`). The main working tree is NOT switched to the issue branch — issue dev happens only in the worktree (ISSUE-0002). If `laplace/<issue-id>` already exists AND is current with main, reuses it in a fresh worktree (idempotent). If the branch exists but is behind main (stale), halts with `BRANCH_STALE:<issue-id>` (exit code 6) and does NOT create a worktree — the human resolves (rebase, delete branch, or force) explicitly. If the working directory is not a git repo (or git is unavailable), records `BRANCH_SKIPPED:not-a-git-repo` in the run log and proceeds with state transitions only — fail-safe, never crashes.
+- Creates the run log at `.harness/state/runs/<run-id>.json` and records the worktree path (`worktree_path`, also mirrored inside the `branch` dict).
 - Transitions `approved -> pm-review`.
 - Every git invocation is routed through `policy.check_command` first; denied commands abort branch setup as skipped, not crash.
 
-Output reports the run id, branch status (created / reused / skipped), and run log path.
+Output reports the run id, branch status (created / reused / stale / skipped), worktree path, and run log path. On `BRANCH_STALE` the run does NOT proceed; surface it to the human.
 
 ### Step 2: PM phase (active in P3)
 
@@ -71,6 +71,7 @@ Workflow:
    - The issue file path (`.harness/issues/<issue-id>.md`)
    - The run id (so the agent can append evidence)
    - The branch name (`laplace/<issue-id>`)
+   - The worktree path (`.harness/worktrees/<issue-id>/`) — the dev agent operates inside the worktree, NOT the main working tree (ISSUE-0002). Pass it as the agent's working directory; all file paths the agent reports must be worktree-relative.
    - The commit instruction: after capturing test evidence and before reporting `ready-for-review`, commit all working-tree changes on `laplace/<issue-id>` with a conventional-commit message referencing the issue id (mandatory unless `BRANCH_SKIPPED` or policy denies `git commit` — record the reason and proceed)
    - Constraints: stay within issue scope, honor policy deny list, do not exceed `max_files_changed_without_approval` / `max_diff_lines_without_approval`
 
@@ -105,6 +106,7 @@ Workflow:
    - The branch name (`laplace/<issue-id>`)
    - The run id
    - The base branch to diff against (default: `main`)
+   - The worktree path (`.harness/worktrees/<issue-id>/`) — the review agent reads the dev diff from the worktree, NOT the main working tree (ISSUE-0002). The diff base is `main`; the diff target is `laplace/<issue-id>`'s HEAD.
 
 2. The review agent returns one of `review-passed`, `needs-fix`, or `recommend-security-review`. Handle each:
 
@@ -222,7 +224,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py end <run-id> --outcome <final-st
 
 `<final-state>` is the issue's terminal or paused state: `review-passed`, `blocked`, `human-approval-required`, `release-candidate` (if the release agent has run in a later phase), or `max-attempts-exceeded`.
 
-`runner.py end` finalizes the run log (`ended_at`, `outcome`) and releases the issue lock by delegating to `state.py run-end`.
+`runner.py end` first removes the per-issue worktree (`.harness/worktrees/<issue-id>/`) via `git worktree remove` (ISSUE-0002). The branch `laplace/<issue-id>` is preserved for later merge. If the worktree has uncommitted changes and `--force-worktree-remove` was not passed, the command halts with `WORKTREE_DIRTY:<issue-id>` (exit code 7) and does NOT finalize the run — the run lock stays held so dev work is not silently discarded. The human inspects the worktree, then either commits/aborts the change and re-runs `end`, or forces removal with `runner.py end <run-id> --outcome <final-state> --force-worktree-remove`. On `BRANCH_SKIPPED` (non-repo), worktree teardown is a no-op. `runner.py end` then finalizes the run log (`ended_at`, `outcome`) and releases the issue lock by delegating to `state.py run-end`.
 
 ## Evidence Capture
 
@@ -283,4 +285,6 @@ Next:
 - **Illegal transition**: `runner.py advance` exits with code 2 with a `validate_transition` reason. The state machine is authoritative; the skill must not retry the same transition.
 - **Agent failure**: if a phase agent returns an error or fails to produce a decision, transition to `blocked` with a redacted summary and stop. Do not silently retry beyond the configured attempt limits.
 - **Git unavailable / not a repo**: `runner.py start` records `BRANCH_SKIPPED:not-a-git-repo` in the run log and proceeds with state transitions only. This is fail-safe behavior, not an error.
+- **Stale branch (ISSUE-0002)**: `runner.py start` exits with code 6 and prints `BRANCH_STALE:<issue-id>: rebase onto main or delete branch`. The issue stays in `approved` and the lock is released. Recommend rebasing `laplace/<issue-id>` onto `main` (or deleting the branch) and re-running `start`.
+- **Dirty worktree at end (ISSUE-0002)**: `runner.py end` exits with code 7 and prints `WORKTREE_DIRTY:<issue-id>` when the worktree has uncommitted changes. The run is NOT finalized and the lock stays held. Inspect `.harness/worktrees/<issue-id>/`, commit or discard the change, then re-run `end`; or force removal with `--force-worktree-remove`.
 - **Run log corrupt or missing on end**: `runner.py end` delegates to `state.py run-end`, which exits with code 1 if the run id is unknown. The lock may remain held; recommend `/laplace:cancel <issue>` or manual `state.py unlock <issue>`.
