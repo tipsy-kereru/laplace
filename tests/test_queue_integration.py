@@ -51,6 +51,22 @@ def _git(args, cwd):
     return r
 
 
+def _worktree_for(issue_id, target):
+    """Resolve the per-issue worktree path from the issue's active run log.
+
+    ISSUE-0002: `runner.cmd_start` records `worktree_path` (top-level + inside
+    the `branch` dict). Returns None when BRANCH_SKIPPED (no worktree).
+    """
+    run_id = state._load_tasks(target).get(issue_id, {}).get("run_id")
+    if not run_id:
+        return None
+    log = state._read_json(
+        os.path.join(state._runs_dir(target), f"{run_id}.json"), default=None)
+    if not isinstance(log, dict):
+        return None
+    return log.get("worktree_path")
+
+
 def _make_repo(base_branch):
     repo = tempfile.mkdtemp(prefix="laplace-qint-repo-")
     _git(["init", "-q", f"--initial-branch={base_branch}"], repo)
@@ -112,12 +128,18 @@ def _log(repo, run_id):
 def _driver_with_commit_and_merge_for(issue_id, target, merge_after):
     """Issue driver: add a commit to the issue branch, drive to review-passed,
     and -- if issue_id is in `merge_after` -- merge its branch into base before
-    returning control to the queue's merge-policy check."""
+    returning control to the queue's merge-policy check.
+
+    ISSUE-0002: the commit lands inside the per-issue worktree (created by
+    runner.cmd_start just before the driver runs); the main working tree stays
+    clean so the optional human-merge checkout of `main` succeeds."""
+    wt = _worktree_for(issue_id, target)
+    assert wt, f"no worktree for {issue_id}"
     marker = f"{issue_id}.txt"
-    with open(os.path.join(target, marker), "w") as f:
+    with open(os.path.join(wt, marker), "w") as f:
         f.write(f"{issue_id}\n")
-    _git(["add", marker], target)
-    _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+    _git(["add", marker], wt)
+    _git(["commit", "-q", "-m", f"work {issue_id}"], wt)
     _drive_to_review_passed(issue_id, target)
     if issue_id in merge_after:
         # Determine the base branch (main preferred, else master).
@@ -276,12 +298,17 @@ def test_two_issue_queue_resume_after_gate_clears():
 def _drive_to_review_passed_with_commit(issue_id, target):
     """Production-sim: add a distinct commit to laplace/<issue_id> then drive
     pm-review -> review-passed. Models the skill driving phases externally
-    (no issue_driver callback)."""
+    (no issue_driver callback).
+
+    ISSUE-0002: the commit lands inside the per-issue worktree (cmd_start
+    created it during the prior queue invocation)."""
+    wt = _worktree_for(issue_id, target)
+    assert wt, f"no worktree for {issue_id}"
     marker = f"{issue_id}.txt"
-    with open(os.path.join(target, marker), "w") as f:
+    with open(os.path.join(wt, marker), "w") as f:
         f.write(f"{issue_id}\n")
-    _git(["add", marker], target)
-    _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+    _git(["add", marker], wt)
+    _git(["commit", "-q", "-m", f"work {issue_id}"], wt)
     return _drive_to_review_passed(issue_id, target)
 
 

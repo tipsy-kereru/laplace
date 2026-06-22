@@ -410,11 +410,12 @@ agents:
 GITIGNORE_TEMPLATE = """\
 # Laplace .harness/ mixed tracking policy.
 # Tracked (project-wide baseline): config, routing rules, agent policy, memory.
-# Ignored (local runtime state, logs, artifacts, issue drafts):
+# Ignored (local runtime state, logs, artifacts, issue drafts, worktrees):
 state/
 logs/
 artifacts/
 issues/
+worktrees/
 """
 
 MEMORY_PROJECT_TEMPLATE = """\

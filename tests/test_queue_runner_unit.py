@@ -114,6 +114,23 @@ def _git(args, cwd):
     return r
 
 
+def _worktree_for(issue_id, target):
+    """Resolve the per-issue worktree path from the issue's active run log.
+
+    ISSUE-0002: `runner.cmd_start` records `worktree_path` (top-level + inside
+    the `branch` dict). The queue_runner's `issue_driver` runs AFTER cmd_start,
+    so the run log exists. Returns None when BRANCH_SKIPPED (no worktree).
+    """
+    run_id = state._load_tasks(target).get(issue_id, {}).get("run_id")
+    if not run_id:
+        return None
+    log = state._read_json(
+        os.path.join(state._runs_dir(target), f"{run_id}.json"), default=None)
+    if not isinstance(log, dict):
+        return None
+    return log.get("worktree_path")
+
+
 def _make_repo(base_branch):
     repo = tempfile.mkdtemp(prefix="laplace-mp-repo-")
     _git(["init", "-q", f"--initial-branch={base_branch}"], repo)
@@ -332,11 +349,16 @@ def test_run_queue_auto_merge_branch_advances_through_queue():
         _seed_approved(repo, "ISSUE-A2")
 
         def drive_with_commit(issue_id, target):
+            # ISSUE-0002: dev commits land inside the per-issue worktree, not
+            # the main working tree. The worktree was created by
+            # runner.cmd_start just before this driver runs.
+            wt = _worktree_for(issue_id, target)
+            assert wt, f"no worktree for {issue_id}"
             marker = f"{issue_id}.txt"
-            with open(os.path.join(target, marker), "w") as f:
+            with open(os.path.join(wt, marker), "w") as f:
                 f.write(f"{issue_id}\n")
-            _git(["add", marker], target)
-            _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+            _git(["add", marker], wt)
+            _git(["commit", "-q", "-m", f"work {issue_id}"], wt)
             _drive_to_review_passed(issue_id, target)
 
         rid, rc = queue_runner._run_queue(None, repo, cfg, drive_with_commit)
@@ -374,13 +396,15 @@ def test_queue_halt_merge_wait_then_resume_advances():
         _seed_approved(repo, "ISSUE-B")
 
         def drive_with_commit(issue_id, target):
-            # Add a distinct commit to the issue branch so it is NOT a
-            # trivial ancestor of main (cmd_start only creates the branch).
+            # ISSUE-0002: commit inside the per-issue worktree so the branch
+            # is NOT a trivial ancestor of main (cmd_start only creates it).
+            wt = _worktree_for(issue_id, target)
+            assert wt, f"no worktree for {issue_id}"
             marker = f"{issue_id}.txt"
-            with open(os.path.join(target, marker), "w") as f:
+            with open(os.path.join(wt, marker), "w") as f:
                 f.write(f"{issue_id}\n")
-            _git(["add", marker], target)
-            _git(["commit", "-q", "-m", f"work {issue_id}"], target)
+            _git(["add", marker], wt)
+            _git(["commit", "-q", "-m", f"work {issue_id}"], wt)
             _drive_to_review_passed(issue_id, target)
 
         # First run: ISSUE-A's branch has a commit, not merged -> halt.

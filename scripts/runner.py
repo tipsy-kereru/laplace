@@ -74,21 +74,39 @@ EXTERNAL_API_MARKERS: Tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Branch isolation
+# Branch isolation (worktree-per-issue, ISSUE-0002)
 # ---------------------------------------------------------------------------
 
-class BranchInfo:
-    """Outcome of branch setup. status in {created, reused, skipped}."""
+# Exit code for stale-branch halt at start (AC-WT-004). The orchestrator
+# surfaces BRANCH_STALE to the human; the issue stays in `approved`.
+EXIT_BRANCH_STALE = 6
 
-    def __init__(self, name: str, status: str, reason: str = "") -> None:
+# Exit code for dirty-worktree halt at end (AC-WT-008). The orchestrator
+# surfaces WORKTREE_DIRTY to the human; the run lock stays held.
+EXIT_WORKTREE_DIRTY = 7
+
+
+class BranchInfo:
+    """Outcome of branch setup. status in {created, reused, stale, skipped}.
+
+    `worktree_path` is set for `created` and `reused` outcomes (the absolute
+    path to the per-issue worktree). It is None for `skipped` (non-repo /
+    policy-denied) and `stale` (branch behind main, no worktree created).
+    """
+
+    def __init__(self, name: str, status: str, reason: str = "",
+                 worktree_path: Optional[str] = None) -> None:
         self.name = name
         self.status = status
         self.reason = reason
+        self.worktree_path = worktree_path
 
-    def to_dict(self) -> Dict[str, str]:
-        out: Dict[str, str] = {"name": self.name, "status": self.status}
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {"name": self.name, "status": self.status}
         if self.reason:
             out["reason"] = self.reason
+        if self.worktree_path:
+            out["worktree_path"] = self.worktree_path
         return out
 
 
@@ -112,57 +130,227 @@ def _branch_name_for(issue_id: str) -> str:
     return f"{BRANCH_PREFIX}/{safe}"
 
 
-def _setup_branch(issue_id: str, target: Optional[str]) -> BranchInfo:
-    """Create or reuse an isolated branch for the issue.
+def _worktree_path(issue_id: str, target: Optional[str]) -> str:
+    """Absolute path to the per-issue worktree.
 
-    Fail-safe: if not in a git repo (or git unavailable), return a skipped
-    BranchInfo so the caller can record BRANCH_SKIPPED in the run log and
-    proceed with state transitions only.
+    Lives under ``<target>/.harness/worktrees/<safe-issue-id>/`` so it is
+    covered by the ``.harness/`` gitignore (ephemeral local state, never
+    committed). The issue-id slash is collapsed to an underscore so the path
+    is a single directory segment.
+    """
+    safe = issue_id.replace("/", "_")
+    return os.path.join(
+        state._harness_root(target), ".harness", "worktrees", safe)
+
+
+def _resolve_base_branch(target: Optional[str]) -> Optional[str]:
+    """Return 'main' or 'master' if that branch exists in the repo, else None.
+
+    Each probe is routed through policy.check_command first (AC-WT-007).
+    """
+    cwd = target or os.getcwd()
+    for base in ("main", "master"):
+        probe = f"git rev-parse --verify {base}"
+        ok, _ = policy.check_command(probe)
+        if not ok:
+            continue
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--verify", base],
+                cwd=cwd, capture_output=True, text=True, timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode == 0:
+            return base
+    return None
+
+
+def _branch_exists(name: str, target: Optional[str]) -> bool:
+    """True iff branch ``name`` exists in the repo. Policy-checked first."""
+    probe = f"git rev-parse --verify {name}"
+    ok, _ = policy.check_command(probe)
+    if not ok:
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--verify", name],
+            cwd=target or os.getcwd(),
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return r.returncode == 0
+
+
+def _setup_branch(issue_id: str, target: Optional[str]) -> BranchInfo:
+    """Create or reuse an isolated worktree+branch for the issue.
+
+    Decision tree (AC-WT-001..007):
+      - Not a git repo / git unavailable → skipped `not-a-git-repo` (AC-WT-006).
+      - No `main`/`master` base resolvable → skipped `no-main-base`.
+      - `laplace/<id>` does NOT exist → `git worktree add -b laplace/<id>
+        <wt_path> <base>` → created (AC-WT-001).
+      - `laplace/<id>` EXISTS:
+          - `git merge-base --is-ancestor <base> laplace/<id>` exit 0
+            (branch is current with or ahead of base) → `git worktree add
+            <wt_path> laplace/<id>` → reused (AC-WT-005).
+          - exit 1 (branch BEHIND base → stale) → stale, no worktree created
+            (AC-WT-004). The caller halts start with BRANCH_STALE.
+
+    Every git op is routed through policy.check_command first (AC-WT-007).
+    On policy denial, returns skipped `policy-denied: <reason>` so the run
+    proceeds with state transitions only (fail-safe).
     """
     name = _branch_name_for(issue_id)
     if not _in_git_repo(target):
         return BranchInfo(name=name, status="skipped", reason="not-a-git-repo")
 
-    # Check current branch first — if we're already on it, idempotent reuse.
-    try:
-        cur = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=target or os.getcwd(), capture_output=True, text=True, timeout=5,
-        )
-        if cur.returncode == 0 and cur.stdout.strip() == name:
-            return BranchInfo(name=name, status="reused")
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        pass
+    cwd = target or os.getcwd()
+    base = _resolve_base_branch(target)
+    if base is None:
+        return BranchInfo(name=name, status="skipped", reason="no-main-base")
 
-    # create: policy-check first. `git checkout -b` is not in policy's deny
-    # list, but we route through check_command regardless per hard constraint.
-    create_cmd = f"git checkout -b {name}"
-    ok, reason = policy.check_command(create_cmd)
+    wt_path = _worktree_path(issue_id, target)
+
+    if not _branch_exists(name, target):
+        # Create the branch in a fresh worktree (AC-WT-001).
+        create_cmd = f"git worktree add -b {name} {wt_path} {base}"
+        ok, reason = policy.check_command(create_cmd)
+        if not ok:
+            return BranchInfo(name=name, status="skipped",
+                              reason=f"policy-denied: {reason}")
+        try:
+            r = subprocess.run(
+                ["git", "worktree", "add", "-b", name, wt_path, base],
+                cwd=cwd, capture_output=True, text=True, timeout=15,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return BranchInfo(name=name, status="skipped",
+                              reason=f"git-error: {exc}")
+        if r.returncode == 0:
+            return BranchInfo(name=name, status="created",
+                              worktree_path=wt_path)
+        return BranchInfo(
+            name=name, status="skipped",
+            reason=f"git-error: {(r.stderr or '').strip()}")
+
+    # Branch exists — stale check (AC-WT-004).
+    # Direction: --is-ancestor <base> <branch>. Exit 0 = base IS ancestor of
+    # branch (branch is current/ahead) → reuse. Exit 1 = base is NOT ancestor
+    # (branch is BEHIND main) → stale.
+    stale_cmd = f"git merge-base --is-ancestor {base} {name}"
+    ok, reason = policy.check_command(stale_cmd)
     if not ok:
         return BranchInfo(name=name, status="skipped",
                           reason=f"policy-denied: {reason}")
-
-    r = subprocess.run(
-        ["git", "checkout", "-b", name],
-        cwd=target or os.getcwd(), capture_output=True, text=True, timeout=10,
-    )
-    if r.returncode == 0:
-        return BranchInfo(name=name, status="created")
-
-    # Branch exists (or checkout -b refused) → try to switch to it.
-    reuse_cmd = f"git checkout {name}"
-    ok2, reason2 = policy.check_command(reuse_cmd)
-    if not ok2:
+    try:
+        stale = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, name],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
         return BranchInfo(name=name, status="skipped",
-                          reason=f"policy-denied: {reason2}")
-    r2 = subprocess.run(
-        ["git", "checkout", name],
-        cwd=target or os.getcwd(), capture_output=True, text=True, timeout=10,
-    )
-    if r2.returncode == 0:
-        return BranchInfo(name=name, status="reused")
+                          reason=f"git-error: {exc}")
+    if stale.returncode == 1:
+        # Branch is behind main → stale. Do NOT create a worktree.
+        return BranchInfo(name=name, status="stale",
+                          reason="branch-not-current-with-main")
+    if stale.returncode != 0:
+        # Unexpected git failure (not exit 0 or 1).
+        return BranchInfo(
+            name=name, status="skipped",
+            reason=f"git-error: {(stale.stderr or '').strip()}")
+
+    # Branch is current/ahead → reuse in a fresh worktree (AC-WT-005).
+    reuse_cmd = f"git worktree add {wt_path} {name}"
+    ok, reason = policy.check_command(reuse_cmd)
+    if not ok:
+        return BranchInfo(name=name, status="skipped",
+                          reason=f"policy-denied: {reason}")
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "add", wt_path, name],
+            cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return BranchInfo(name=name, status="skipped",
+                          reason=f"git-error: {exc}")
+    if r.returncode == 0:
+        return BranchInfo(name=name, status="reused",
+                          worktree_path=wt_path)
     return BranchInfo(name=name, status="skipped",
-                      reason=f"git-error: {(r.stderr or r2.stderr or '').strip()}")
+                      reason=f"git-error: {(r.stderr or '').strip()}")
+
+
+def _teardown_worktree(issue_id: str, target: Optional[str],
+                       run_log: Optional[Dict[str, Any]],
+                       force: bool = False) -> Tuple[int, str]:
+    """Remove the per-issue worktree at end-of-run (AC-WT-003, AC-WT-008).
+
+    Reads ``worktree_path`` from the run log. Absent (BRANCH_SKIPPED) → skip
+    (nothing to remove). If the dir exists:
+      - Probe dirty via `git -C <wt> status --porcelain`. Non-empty output
+        AND not forced → halt with WORKTREE_DIRTY (AC-WT-008): return a
+        non-zero rc, do NOT remove the worktree, do NOT finalize the run.
+      - Clean (or forced) → `git worktree remove <wt>` (policy-checked first).
+        The branch ``laplace/<id>`` is NOT deleted (preserved for merge,
+        AC-WT-003).
+
+    Returns (rc, status) where status is one of:
+      "removed"        — worktree removed successfully.
+      "dirty-halt"     — dirty worktree, not forced, run MUST halt.
+      "skipped"        — no worktree_path in run log, or dir already gone.
+
+    The caller records `worktree_teardown` into the run log and decides
+    whether to proceed with state.cmd_run_end (rc==0) or halt (rc!=0).
+    """
+    wt_path = None
+    if isinstance(run_log, dict):
+        wt_path = run_log.get("worktree_path")
+    if not wt_path:
+        return 0, "skipped"
+    if not os.path.isdir(wt_path):
+        return 0, "skipped"
+
+    # Dirty probe (AC-WT-008).
+    dirty_cmd = f"git -C {wt_path} status --porcelain"
+    ok, reason = policy.check_command(dirty_cmd)
+    if not ok:
+        # Policy denial on the probe — treat as halt to be safe (fail-safe
+        # preserves dev work; the human can inspect and force).
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+    try:
+        r = subprocess.run(
+            ["git", "-C", wt_path, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+    if r.returncode == 0 and r.stdout.strip() and not force:
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+
+    # Clean (or forced) — remove the worktree. Branch is preserved (AC-WT-003).
+    rm_args = ["git", "worktree", "remove"]
+    if force:
+        rm_args.append("--force")
+    rm_args.append(wt_path)
+    rm_cmd = " ".join(rm_args)
+    ok, reason = policy.check_command(rm_cmd)
+    if not ok:
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+    try:
+        rr = subprocess.run(
+            rm_args,
+            cwd=state._harness_root(target),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+    if rr.returncode != 0:
+        # git refused (e.g. dirty despite probe) — fail safe.
+        return EXIT_WORKTREE_DIRTY, "dirty-halt"
+    return 0, "removed"
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +386,10 @@ def _create_run_log(issue_id: str, branch: BranchInfo,
         "evidence": [],
         "transitions": [],
         "branch": branch.to_dict(),
+        # Top-level mirror of branch.worktree_path (AC-WT-009). None when
+        # BRANCH_SKIPPED or stale; teardown reads this to know where to
+        # `git worktree remove`.
+        "worktree_path": branch.worktree_path,
     }
     state._atomic_write_json(_run_log_path(run_id, target), run)
     return run_id
@@ -274,6 +466,13 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     try:
         branch = _setup_branch(issue_id, args.target)
+        # Stale branch (AC-WT-004): branch exists but is behind main. Halt
+        # start without creating a worktree, without transitioning state, and
+        # release the lock so the human can resolve (rebase, delete branch).
+        if branch.status == "stale":
+            state.release_lock(issue_id, target=args.target)
+            print(f"BRANCH_STALE:{issue_id}: rebase onto main or delete branch")
+            return EXIT_BRANCH_STALE
         run_id = _create_run_log(issue_id, branch, args.target)
         # State transition approved -> pm-review (SPEC-002 normal flow).
         state._set_issue_state(issue_id, "pm-review", target=args.target,
@@ -296,6 +495,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"\nEvidence:")
     print(f"  - run log: {_run_log_path(run_id, args.target)}")
     print(f"  - branch: {branch_note}")
+    if branch.worktree_path:
+        print(f"  - worktree: {branch.worktree_path}")
     print(f"\nArtifacts:")
     print(f"  - .harness/state/runs/{run_id}.json")
     print(f"\nNext:")
@@ -468,6 +669,30 @@ def cmd_evidence(args: argparse.Namespace) -> int:
 
 
 def cmd_end(args: argparse.Namespace) -> int:
+    # Worktree teardown happens BEFORE state.cmd_run_end (AC-WT-003/008).
+    # Read the run log to find the worktree path. If the worktree is dirty
+    # and --force-worktree-remove is not set, halt with WORKTREE_DIRTY and
+    # leave the run lock held (state.cmd_run_end is NOT called, so the run
+    # is not finalized).
+    run_log = state._read_json(
+        _run_log_path(args.run_id, args.target), default=None)
+    issue_id = None
+    if isinstance(run_log, dict):
+        issue_id = run_log.get("issue_id")
+    force = bool(getattr(args, "force_worktree_remove", False))
+    wt_rc, wt_status = _teardown_worktree(
+        issue_id, args.target, run_log, force=force)
+    # Persist the teardown status into the run log (AC-WT-009) when we can.
+    if isinstance(run_log, dict):
+        run_log["worktree_teardown"] = wt_status
+        state._atomic_write_json(_run_log_path(args.run_id, args.target), run_log)
+    if wt_rc != 0:
+        # Dirty worktree halt (AC-WT-008). Lock stays held; run NOT finalized.
+        print(f"WORKTREE_DIRTY:{issue_id}: uncommitted changes in worktree; "
+              f"re-run with --force-worktree-remove to discard",
+              file=sys.stderr)
+        return wt_rc
+
     # Delegate finalization + lock release to state.cmd_run_end. It reads the
     # run log, sets ended_at + outcome, and releases the issue lock.
     ns = argparse.Namespace(
@@ -1244,15 +1469,16 @@ def selftest() -> int:
                 f"security-check ISSUE-0006+workflow diff should trigger; "
                 f"got: {cap.getvalue()!r}")
 
-        # --- AC-SI-008: dev commit characterization -------------------------
+        # --- AC-SI-008 + ISSUE-0002 worktree characterization ----------------
         # Invariant: after the dev phase, the issue branch HEAD is ahead of
-        # its base (i.e. at least one commit exists on the branch beyond the
-        # base). We simulate the dev agent's commit via subprocess git,
-        # routed through policy.check_command exactly as _setup_branch does.
+        # its base. With worktree-per-issue the dev agent operates inside
+        # binfo.worktree_path; the main tree stays on `main` and is clean.
+        # Also exercised: stale branch detection, teardown removes the dir
+        # but preserves the branch.
         gitrepo = tempfile.mkdtemp(prefix="laplace-runner-git-")
         try:
-            def _git(args: list) -> subprocess.CompletedProcess:
-                r = subprocess.run(["git", "-C", gitrepo] + args,
+            def _git(args: list, cwd: str = gitrepo) -> subprocess.CompletedProcess:
+                r = subprocess.run(["git", "-C", cwd] + args,
                                    capture_output=True, text=True, timeout=10)
                 return r
 
@@ -1261,19 +1487,39 @@ def selftest() -> int:
             _git(["config", "user.name", "selftest"])
             with open(os.path.join(gitrepo, "README.md"), "w") as f:
                 f.write("base\n")
-            _git(["add", "README.md"])
+            # .harness/ holds the ephemeral worktrees (and is the convention
+            # in production repos via `state.cmd_init`). Gitignore it so the
+            # main tree stays clean after worktree creation (AC-WT-002).
+            with open(os.path.join(gitrepo, ".gitignore"), "w") as f:
+                f.write(".harness/\n")
+            _git(["add", "README.md", ".gitignore"])
             _git(["commit", "-q", "-m", "base"])
             base_sha = _git(["rev-parse", "main"]).stdout.strip()
+            main_head_before = base_sha
 
-            # runner.py _setup_branch equivalent: create the issue branch.
+            # _setup_branch now creates a worktree on laplace/ISSUE-0007.
             binfo = _setup_branch("ISSUE-0007", gitrepo)
-            if binfo.status not in ("created", "reused"):
+            if binfo.status != "created":
                 failures.append(
-                    f"AC-SI-008: _setup_branch should create/reuse in git repo, "
-                    f"got {binfo}")
-            # Simulate the dev agent: write a change, route the commit
-            # through policy.check_command (no runner primitive exists).
-            with open(os.path.join(gitrepo, "change.txt"), "w") as f:
+                    f"AC-WT-001: _setup_branch should create worktree in git "
+                    f"repo, got {binfo.status}/{binfo.reason}")
+            if not binfo.worktree_path or not os.path.isdir(binfo.worktree_path):
+                failures.append(
+                    f"AC-WT-001: worktree dir not created at "
+                    f"{binfo.worktree_path}")
+            # AC-WT-002: main tree stays on `main`, clean.
+            cur_branch = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+            if cur_branch != "main":
+                failures.append(
+                    f"AC-WT-002: main tree switched to {cur_branch!r}, expected main")
+            main_status = _git(["status", "--porcelain"]).stdout.strip()
+            if main_status:
+                failures.append(
+                    f"AC-WT-002: main tree dirty after _setup_branch: {main_status!r}")
+
+            # Simulate the dev agent: write + commit INSIDE the worktree.
+            wt = binfo.worktree_path
+            with open(os.path.join(wt, "change.txt"), "w") as f:
                 f.write("dev work\n")
             commit_cmd = "git add change.txt && git commit -m feat(x): dev (ISSUE-0007)"
             ok, reason = policy.check_command(commit_cmd)
@@ -1281,23 +1527,100 @@ def selftest() -> int:
                 failures.append(
                     f"AC-SI-008: policy denied simulated dev commit: {reason}")
             else:
-                r = _git(["add", "change.txt"])
+                r = _git(["add", "change.txt"], cwd=wt)
                 r2 = _git(["commit", "-q", "-m",
-                           "feat(x): dev (ISSUE-0007)"])
+                           "feat(x): dev (ISSUE-0007)"], cwd=wt)
                 if r.returncode != 0 or r2.returncode != 0:
                     failures.append(
                         f"AC-SI-008: simulated dev commit failed: "
                         f"{r.stderr}{r2.stderr}")
-            head_sha = _git(["rev-parse", "HEAD"]).stdout.strip()
-            if head_sha == base_sha:
+            # Branch HEAD is the worktree HEAD, ahead of base.
+            branch_head = _git(["rev-parse", "laplace/ISSUE-0007"]).stdout.strip()
+            if branch_head == base_sha:
                 failures.append(
                     "AC-SI-008: issue branch HEAD equals base after dev commit; "
                     "review would see an empty diff")
-            # rev-list count of commits on branch not on base must be >= 1.
-            ahead = _git(["rev-list", "--count", f"{base_sha}..HEAD"])
+            ahead = _git(["rev-list", "--count", f"{base_sha}..laplace/ISSUE-0007"])
             if not (ahead.returncode == 0 and int(ahead.stdout.strip() or "0") >= 1):
                 failures.append(
                     f"AC-SI-008: branch not ahead of base after dev: {ahead.stdout}")
+            # AC-WT-002: main tree HEAD still on base, main tree still clean.
+            main_head_after = _git(["rev-parse", "main"]).stdout.strip()
+            if main_head_after != main_head_before:
+                failures.append(
+                    f"AC-WT-002: main tree HEAD moved ({main_head_before} -> "
+                    f"{main_head_after}); dev commit leaked into main tree")
+            main_status2 = _git(["status", "--porcelain"]).stdout.strip()
+            if main_status2:
+                failures.append(
+                    f"AC-WT-002: main tree dirty after dev commit: {main_status2!r}")
+
+            # AC-WT-008: dirty worktree halts teardown. Leave a change.txt mod
+            # (already committed above), so add a NEW uncommitted file.
+            with open(os.path.join(wt, "uncommitted.txt"), "w") as f:
+                f.write("dirty\n")
+            dirty_run_log = {"worktree_path": wt}
+            wt_rc, wt_st = _teardown_worktree(
+                "ISSUE-0007", gitrepo, dirty_run_log, force=False)
+            if wt_rc != EXIT_WORKTREE_DIRTY or wt_st != "dirty-halt":
+                failures.append(
+                    f"AC-WT-008: dirty worktree should halt teardown, got "
+                    f"rc={wt_rc} status={wt_st}")
+            if not os.path.isdir(wt):
+                failures.append(
+                    "AC-WT-008: dirty worktree was removed despite halt")
+            # Force-removing the dirty worktree is allowed.
+            wt_rc2, wt_st2 = _teardown_worktree(
+                "ISSUE-0007", gitrepo, dirty_run_log, force=True)
+            if wt_rc2 != 0 or wt_st2 != "removed":
+                failures.append(
+                    f"AC-WT-008: forced teardown should succeed, got "
+                    f"rc={wt_rc2} status={wt_st2}")
+            if os.path.isdir(wt):
+                failures.append(
+                    "AC-WT-003/008: worktree dir still present after teardown")
+            # AC-WT-003: branch preserved after worktree removal.
+            if not _branch_exists("laplace/ISSUE-0007", gitrepo):
+                failures.append(
+                    "AC-WT-003: laplace/ISSUE-0007 branch deleted by teardown")
+
+            # AC-WT-005: re-run _setup_branch on the existing branch — main is
+            # an ancestor (branch is ahead), so status=reused in a fresh wt.
+            binfo2 = _setup_branch("ISSUE-0007", gitrepo)
+            if binfo2.status != "reused" or not binfo2.worktree_path:
+                failures.append(
+                    f"AC-WT-005: reuse should rebuild worktree, got {binfo2}")
+            if binfo2.worktree_path and os.path.isdir(binfo2.worktree_path):
+                # Clean up the reused worktree.
+                _teardown_worktree(
+                    "ISSUE-0007", gitrepo, {"worktree_path": binfo2.worktree_path},
+                    force=True)
+
+            # AC-WT-004: stale branch. Create laplace/ISSUE-0008 behind main,
+            # then advance main so the branch is no longer current.
+            stale_wt = _worktree_path("ISSUE-0008", gitrepo)
+            stale_setup = _setup_branch("ISSUE-0008", gitrepo)
+            if stale_setup.status != "created":
+                failures.append(
+                    f"AC-WT-004 setup: expected created for ISSUE-0008, got "
+                    f"{stale_setup}")
+            # Teardown so we can re-setup without 'already checked out' errors.
+            _teardown_worktree("ISSUE-0008", gitrepo,
+                               {"worktree_path": stale_wt}, force=True)
+            # Advance main past the branch.
+            with open(os.path.join(gitrepo, "main2.txt"), "w") as f:
+                f.write("advance\n")
+            _git(["add", "main2.txt"])
+            _git(["commit", "-q", "-m", "advance main"])
+            stale_check = _setup_branch("ISSUE-0008", gitrepo)
+            if stale_check.status != "stale":
+                failures.append(
+                    f"AC-WT-004: stale branch should be detected, got "
+                    f"{stale_check.status}/{stale_check.reason}")
+            if os.path.isdir(stale_wt):
+                failures.append(
+                    f"AC-WT-004: stale branch must NOT create a worktree; "
+                    f"wt dir exists at {stale_wt}")
         finally:
             shutil.rmtree(gitrepo, ignore_errors=True)
     finally:
@@ -1354,6 +1677,10 @@ def main(argv: Optional[list] = None) -> int:
     _add_target_arg(p)
     p.add_argument("run_id")
     p.add_argument("--outcome", default="completed")
+    p.add_argument("--force-worktree-remove", action="store_true",
+                   default=False,
+                   help="Remove a dirty worktree at end (discards uncommitted "
+                        "dev work; default halts with WORKTREE_DIRTY)")
     p.set_defaults(func=cmd_end)
 
     p = sub.add_parser(
