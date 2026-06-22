@@ -1,5 +1,7 @@
 # Laplace
 
+> Procedure over capability — a local, stoppable engineering loop for Claude Code.
+
 Laplace is a Claude Code plugin for **local AI engineering loop execution**. It enforces procedure, not model capability: context before decomposition, local issue state before execution, scoped changes before review, verification before completion, review/security gates before release-candidate, and human approval before irreversible or external side effects.
 
 ---
