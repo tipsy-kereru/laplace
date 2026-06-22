@@ -271,6 +271,7 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 | `/laplace:report <issue>` | Review sanitized evidence and verdicts |
 | `/laplace:cancel [issue]` | Stop a loop safely (keeps state) |
 | `/laplace:create-pr <issue>` | Issue is `review-passed`, you want a PR |
+| `/laplace:release <X.Y.Z>` | Main is green, tests pass, you want to cut a release |
 
 ---
 
@@ -292,6 +293,29 @@ Intake is mechanical; it can produce TBD fields, mis-parsed subheadings, or PRD 
 - Cross-issue — broken `depends_on` refs and duplicate AC (>80% overlap, warn).
 
 Verify does NOT transition state and does NOT block `/laplace:approve`. It is advisory; the human still owns the approve gate for scope/risk judgment. Exit codes: `0` clean or warn-only / `1` any fail / `2` usage error.
+
+
+### Use case — Release a version
+
+Releasing a Laplace version is a 5-step ceremony (bump 3 files, commit, tag, push main, push tag) that `/laplace:release` automates behind an 8-check gate. The release has two halves: the local half (`/laplace:release`) and the remote half (the CI release workflow on tag push).
+
+**Local half — `/laplace:release <X.Y.Z>`**
+
+```
+/laplace:release 0.3.1
+```
+
+Runs 8 checks in order (branch = main, format = `X.Y.Z`, tests pass, three-file sync after bump, semver is an upgrade, tree clean, tag absent, remote not ahead, no pending approved issues). On any failure: halt with a resolution message, no side effects, exit 1. On all-pass: bumps `VERSION` + `.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json`, commits `chore(release): bump <old> -> <new>`, tags `v<X.Y.Z>`, pushes main, pushes the tag.
+
+Invocation of `/laplace:release` IS the authorization for the push (Option A, mirrors `/laplace:create-pr`). Push is irreversible; the 8-check gate is the guardrail. Every attempt appends to `.harness/state/releases.jsonl` (success: `{checks_passed: true, sequence_ok: true, pushed_at, commit, tag, authorization_basis: "release-invocation"}`; halt: `{checks_passed: false, failed_check, reason}`).
+
+`--force` relaxes ONLY the downgrade (check 4) and pending-approved (check 8) checks. It NEVER skips format, tests, sync, tree-clean, tag-absent, or remote checks.
+
+**Partial-push recovery (R-2)**: if main push succeeds but tag push fails (network blip), `/laplace:release` halts with `PARTIAL RELEASE: main pushed, tag push failed`. It does NOT roll back main (the commit is already public). Recover manually: `git push origin v<X.Y.Z>`.
+
+**Remote half — CI release workflow**
+
+The existing `.github/workflows/release.yml` (unchanged) fires on tag push, validates three-way version consistency, and creates the GitHub Release with notes generated from commits. `/laplace:release` is the local half; CI is the remote half.
 
 
 ---
