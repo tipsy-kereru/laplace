@@ -9,7 +9,7 @@
       "name": "laplace",
       "source": "./.",
       "description": "Local AI engineering loop execution harness for Claude Code. Converts PRDs or stories into local issues, routes each issue through scoped agent phases, runs verification, records evidence, and stops at explicit human approval gates.",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "category": "harness",
       "maturity": "draft"
     }
