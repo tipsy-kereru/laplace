@@ -132,14 +132,19 @@ def _run_git(cmd: List[str], *, target: Optional[str] = None,
     authorization — proceed anyway. All other denials raise GitPolicyError.
     """
     cmd_str = _cmd_to_str(cmd)
-    allowed, reason = policy.check_command(cmd_str)
+    # policy.check_command matches deny regexes against the full command
+    # including the leading "git" token (e.g. `(^|\s)git\s+push\b`). The
+    # subprocess call prepends "git", so we must do the same here or the
+    # push deny rule never fires and Option A becomes dead code.
+    policy_str = "git " + cmd_str
+    allowed, reason = policy.check_command(policy_str)
     if not allowed:
-        is_push = "git push" in cmd_str
+        is_push = "git push" in policy_str
         if allow_push and is_push:
             # Invocation-authorized push (Option A). Proceed.
             pass
         else:
-            raise GitPolicyError(f"{cmd_str}: {reason}")
+            raise GitPolicyError(f"{policy_str}: {reason}")
     cwd = target or os.getcwd()
     result = subprocess.run(
         ["git"] + cmd,
@@ -297,6 +302,10 @@ def _atomic_sequence(target: str, version: str, prev: str
     # 2. Post-bump sync self-check (check 3).
     ok, reason = _check_sync_after_bump(target, version)
     if not ok:
+        # Roll back the bumped files so a sync-selfcheck failure leaves the
+        # working tree clean (AC-REL-011 halt-safety).
+        _run_git(["checkout", "--"] + [_VERSION_FILES[k] for k in _VERSION_FILES],
+                 target=target, check=False)
         info["failed_step"] = "sync_after_bump"
         info["reason"] = reason
         return False, info
