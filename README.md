@@ -282,6 +282,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:discard <issue>` | Remove a draft issue (atomic, draft-only) |
 | `/laplace:run [issue]` | Execute one issue loop |
 | `/laplace:run-queue [issue]` | Run approved issues as a queue — auto-advances on review-passed, halts at gates |
+| `/laplace:pipeline <prd>` | Checkpoint pipeline: composes intake → verify → approve-gate → run-parallel → release-gate, halts at every gate, resumes on re-invocation |
 | `/laplace:status` | Show current harness state |
 | `/laplace:report <issue>` | Generate or show issue report |
 | `/laplace:cancel [issue]` | Stop active loop safely |

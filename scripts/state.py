@@ -720,6 +720,41 @@ def _find_active_parallel_run(target: Optional[str] = None) \
     return candidates[0]
 
 
+def _find_active_pipeline_run(target: Optional[str] = None) \
+        -> Optional[Dict[str, Any]]:
+    """Find the most-recent active pipeline-run log under .harness/state/runs/.
+
+    A pipeline-run log (ISSUE-0005) is "active" when it is not finalized:
+    ``kind == "pipeline"`` AND ``outcome`` is None. Finalized outcomes
+    (``released``, ``cancelled``, ``intake-failed``, ``verify-failed`` etc.)
+    are inactive. Returns the most recent by ``started_at``, or None.
+
+    Used by ``_format_status`` (AC-PL-009), ``cancel`` (AC-PL-010), and by
+    ``pipeline.py`` for resume (R-3 ambiguity check).
+    """
+    runs_dir = _runs_dir(target)
+    if not os.path.isdir(runs_dir):
+        return None
+    candidates: List[Dict[str, Any]] = []
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = _read_json(os.path.join(runs_dir, name), default=None)
+        if not isinstance(log, dict):
+            continue
+        if log.get("kind") != "pipeline":
+            continue
+        if log.get("outcome") is not None:
+            continue
+        candidates.append(log)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda l: float(l.get("started_at") or 0.0),
+        reverse=True)
+    return candidates[0]
+
+
 def _parallel_in_flight_pairs(log: Dict[str, Any],
                               target: Optional[str] = None) \
         -> List[Tuple[str, str]]:
@@ -817,6 +852,39 @@ def _format_status(target: Optional[str] = None) -> str:
         lines.append(f"  halted: {len(halted)}")
         if halted:
             lines.append(f"    {', '.join(halted)}")
+    # Active pipeline-run block (ISSUE-0005, AC-PL-009). Only emitted when
+    # an active (non-finalized) pipeline log exists, so output is byte-
+    # identical when no pipeline is active (AC-PL-009 characterization).
+    pipeline = _find_active_pipeline_run(target)
+    if pipeline is not None:
+        phase = pipeline.get("phase", "?")
+        prd = pipeline.get("prd", "?")
+        try:
+            prd_base = os.path.basename(prd)
+        except Exception:
+            prd_base = "?"
+        p_tasks = _load_tasks(target)
+        p_queue = _load_queue(target)
+        drafts = len(p_queue.get("draft", []))
+        approved = len(p_queue.get("approved", []))
+        in_flight_p = sum(
+            1 for tid, meta in p_tasks.items()
+            if meta.get("status") in ("pm-review", "ready-for-dev",
+                                      "in-progress", "review", "needs-fix",
+                                      "security-review"))
+        merge_waited = 0
+        resumable_q = _find_resumable_queue_run(target)
+        if resumable_q is not None:
+            merge_waited = 1
+        lines.append("")
+        lines.append("Pipeline:")
+        lines.append(f"  run id: {pipeline.get('run_id', '?')}")
+        lines.append(f"  phase: {phase}")
+        lines.append(f"  prd: {prd_base}")
+        lines.append(f"  drafts: {drafts}")
+        lines.append(f"  approved: {approved}")
+        lines.append(f"  in-flight: {in_flight_p}")
+        lines.append(f"  merge-waited: {merge_waited}")
     lines.append("")
     lines.append("Next action:")
     if queue.get("approved") and not active_run:

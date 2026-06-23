@@ -26,6 +26,7 @@ SELFTEST_TARGETS = [
     ("scripts/report.py", "report"),
     ("scripts/profile.py", "profile"),
     ("scripts/validate.py", "validate"),
+    ("scripts/pipeline.py", "pipeline"),
     ("hooks/pretooluse.py", "pretooluse"),
     ("hooks/posttooluse.py", "posttooluse"),
     ("hooks/stop-loop.py", "stop-loop"),
