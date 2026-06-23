@@ -254,24 +254,46 @@ def _read_issue_run_id(issue_id: str, target: Optional[str]) -> Optional[str]:
 
 def _compute_sets(approved: List[str], halted: List[str],
                   target: Optional[str]) -> Tuple[List[str], List[str]]:
-    """Compute (in_flight, ready) lists from the approved queue.
+    """Compute (in_flight, ready) lists.
 
-    in_flight = approved issues whose current status is a non-terminal
-    "running" status (pm-review/ready-for-dev/in-progress/review/
-    needs-fix/security-review).
+    in_flight = ALL issues (regardless of current queue) whose status is a
+    non-terminal "running" status (pm-review/ready-for-dev/in-progress/
+    review/needs-fix/security-review) AND whose run is not finalized. This
+    is read from tasks.json, NOT the approved queue, because a dispatched
+    issue transitions approved -> pm-review and leaves the approved queue;
+    counting in-flight from the approved list would miss it and un-enforce
+    the max_parallel cap on the next wave (ISSUE-0010).
+
+    The run-log-finalized guard handles the case where cmd_end finalizes a
+    run (outcome=blocked/cancelled/completed, ended_at set) without
+    updating tasks[issue].status -- such an issue is effectively terminal
+    even though its workflow status is still e.g. pm-review. Without this
+    guard it would be wrongly counted as in-flight forever.
+
     ready = approved issues not in_flight, not halted, and whose deps are
-    satisfied (state._dependencies_satisfied). Preserves approved order.
+    satisfied (state._dependencies_satisfied). Only approved issues can be
+    dispatched, so ready still iterates the approved queue. Preserves
+    approved order.
     """
     tasks = state._load_tasks(target)
     in_flight: List[str] = []
-    for iid in approved:
-        st = tasks.get(iid, {}).get("status")
-        if st in IN_FLIGHT_STATUSES:
-            in_flight.append(iid)
+    in_flight_set: set = set()
+    for iid, rec in tasks.items():
+        if rec.get("status") not in IN_FLIGHT_STATUSES:
+            continue
+        # Defense: skip issues whose run has been finalized (ended_at set).
+        run_id = rec.get("run_id")
+        if run_id:
+            run_log = state._read_json(
+                runner._run_log_path(run_id, target), default=None)
+            if isinstance(run_log, dict) and run_log.get("ended_at") is not None:
+                continue
+        in_flight.append(iid)
+        in_flight_set.add(iid)
     halted_set = set(halted)
     ready: List[str] = []
     for iid in approved:
-        if iid in in_flight:
+        if iid in in_flight_set:
             continue
         if iid in halted_set:
             continue
