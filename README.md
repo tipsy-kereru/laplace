@@ -286,6 +286,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:report <issue>` | Generate or show issue report |
 | `/laplace:cancel [issue]` | Stop active loop safely |
 | `/laplace:create-pr <issue>` | Create GitHub PR after approval |
+| `/laplace:release <X.Y.Z>` | Release a version: 8-check gate, bump 3 files, commit, tag, push (halt on failure) |
 | `/laplace:list` | _(planned — P5/P6)_ List local issues and queue state |
 | `/laplace:show <issue>` | _(planned — P5/P6)_ Show issue details |
 | `/laplace:logs <run>` | _(planned — P5/P6)_ Show sanitized run logs |
