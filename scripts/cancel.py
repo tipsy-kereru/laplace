@@ -24,7 +24,7 @@ import argparse
 import os
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -111,6 +111,52 @@ def _finalize_queue_cancel(run_id: str, target: Optional[str]) \
     return log
 
 
+def _parallel_in_flight_child_runs(log: Dict[str, Any],
+                                   target: Optional[str]) \
+        -> List[Tuple[str, str]]:
+    """Return (issue_id, run_id) for in-flight children of a parallel log.
+
+    In-flight = child run's issue is in a non-terminal status. Reads each
+    child run log for its ``issue_id`` and uses the issue's recorded
+    ``run_id`` from tasks.json.
+    """
+    tasks = state._load_tasks(target)
+    runs_dir = state._runs_dir(target)
+    out: List[Tuple[str, str]] = []
+    for child_run_id in (log.get("issues") or []):
+        child_path = os.path.join(runs_dir, f"{child_run_id}.json")
+        child = state._read_json(child_path, default=None)
+        if not isinstance(child, dict):
+            continue
+        issue_id = child.get("issue_id")
+        if not isinstance(issue_id, str) or not issue_id:
+            continue
+        status = tasks.get(issue_id, {}).get("status")
+        if status in state.TERMINAL_STATES:
+            continue
+        rid = tasks.get(issue_id, {}).get("run_id") or child_run_id
+        out.append((issue_id, rid))
+    return out
+
+
+def _finalize_parallel_cancel(run_id: str, target: Optional[str]) \
+        -> Optional[Dict[str, Any]]:
+    """Finalize the active parallel parent log as cancelled.
+
+    Sets ``outcome`` to ``cancelled`` and bumps ``ended_at``. Records the
+    wave position for resume by leaving the ``waves`` array intact. Writes
+    atomically. Returns the rewritten log, or None if missing/malformed.
+    """
+    path = os.path.join(state._runs_dir(target), f"{run_id}.json")
+    log = state._read_json(path, default=None)
+    if not isinstance(log, dict):
+        return None
+    log["outcome"] = state._redact_evidence("cancelled")
+    log["ended_at"] = time.time()
+    state._atomic_write_json(path, log)
+    return log
+
+
 # ---------------------------------------------------------------------------
 # Command
 # ---------------------------------------------------------------------------
@@ -137,6 +183,20 @@ def _print_queue_result(run_id: str, merge_waited_issue: str,
     print(f"\nNext:")
     print(f"  /laplace:status  (Queue run: block is gone)")
     print(f"  /laplace:run-queue  (starts fresh from approved head)")
+
+
+def _print_parallel_result(run_id: str, cancelled_issues: List[str],
+                           wave_count: int) -> None:
+    print("Cancelled parallel run.")
+    print(f"  Parallel run: {run_id}")
+    print(f"  Waves at cancel: {wave_count}")
+    print(f"  In-flight issues torn down ({len(cancelled_issues)}):")
+    for iid in cancelled_issues:
+        print(f"    {iid}")
+    print(f"  Outcome: cancelled")
+    print(f"\nNext:")
+    print(f"  /laplace:status  (Parallel run: block is gone)")
+    print(f"  /laplace:run-parallel  (starts fresh wave from approved queue)")
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
@@ -181,6 +241,41 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             issue_id=issue_id, line=f"cancel: {run_id} -> cancelled",
             target=target)
         _print_single_result(issue_id, run_id, target)
+        return 0
+
+    # Path 2b: no arg + active parallel run -> tear down all in-flight
+    # children, finalize the parent parallel log as cancelled (AC-PQ-010).
+    # Inserted between single-issue and sequential-queue detection so the
+    # parallel lifecycle (multi-child) takes precedence over the sequential
+    # queue's single-merge-wait resume when a parallel run is live.
+    parallel = state._find_active_parallel_run(target)
+    if parallel is not None:
+        p_run_id = parallel.get("run_id") or ""
+        children = _parallel_in_flight_child_runs(parallel, target)
+        cancelled_issues: List[str] = []
+        for issue_id, child_run_id in children:
+            rc = runner.cmd_end(argparse.Namespace(
+                run_id=child_run_id, outcome="cancelled", evidence=None,
+                target=target))
+            if rc != 0:
+                # Surface the child failure but continue tearing down the
+                # rest (best-effort cancel). The parent log is still
+                # finalized below so it drops out of the active set.
+                print(f"warning: child cancel failed for {issue_id} "
+                      f"(rc={rc})", file=sys.stderr)
+            else:
+                _set_issue_cancelled(issue_id, child_run_id, target)
+                runner._append_run_history_to_issue(
+                    issue_id=issue_id,
+                    line=f"parallel-cancel: {child_run_id} -> cancelled",
+                    target=target)
+            cancelled_issues.append(issue_id)
+        rewritten = _finalize_parallel_cancel(p_run_id, target)
+        if rewritten is None:
+            print(f"parallel run log not found: {p_run_id}", file=sys.stderr)
+            return 1
+        wave_count = len(rewritten.get("waves") or [])
+        _print_parallel_result(p_run_id, cancelled_issues, wave_count)
         return 0
 
     # Path 3: no active single run + resumable queue -> cancel the queue run.

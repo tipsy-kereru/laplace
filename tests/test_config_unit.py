@@ -112,6 +112,52 @@ def test_load_config_accepts_valid_auto_merge_policy() -> None:
     assert cfg["max_queue_run"] == 8
 
 
+def test_load_config_default_max_parallel_when_key_absent() -> None:
+    """ISSUE-0004: old-format config.yml without max_parallel defaults to 2."""
+    with tempfile.TemporaryDirectory(prefix="laplace-cfg-") as tmp:
+        _write_config(tmp, OLD_CONFIG_YML)
+        cfg = state.load_config(target=tmp)
+    assert cfg["max_parallel"] == state.MAX_PARALLEL == 2
+
+
+def test_load_config_accepts_explicit_max_parallel() -> None:
+    """An explicit positive max_parallel is parsed and returned."""
+    good = OLD_CONFIG_YML.replace(
+        "  max_stop_hook_iterations: 12\n",
+        "  max_stop_hook_iterations: 12\n  max_parallel: 4\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="laplace-cfg-") as tmp:
+        _write_config(tmp, good)
+        cfg = state.load_config(target=tmp)
+    assert cfg["max_parallel"] == 4
+
+
+def test_load_config_rejects_non_positive_max_parallel() -> None:
+    """Zero max_parallel is rejected with exit code 2."""
+    bad = OLD_CONFIG_YML.replace(
+        "  max_stop_hook_iterations: 12\n",
+        "  max_stop_hook_iterations: 12\n  max_parallel: 0\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="laplace-cfg-") as tmp:
+        _write_config(tmp, bad)
+        with pytest.raises(SystemExit) as exc:
+            state.load_config(target=tmp)
+    assert exc.value.code == 2
+
+
+def test_load_config_rejects_non_int_max_parallel() -> None:
+    """Non-integer max_parallel is rejected with exit code 2."""
+    bad = OLD_CONFIG_YML.replace(
+        "  max_stop_hook_iterations: 12\n",
+        "  max_stop_hook_iterations: 12\n  max_parallel: plenty\n",
+    )
+    with tempfile.TemporaryDirectory(prefix="laplace-cfg-") as tmp:
+        _write_config(tmp, bad)
+        with pytest.raises(SystemExit) as exc:
+            state.load_config(target=tmp)
+    assert exc.value.code == 2
+
+
 def test_init_writes_both_new_keys() -> None:
     """AC-QR-001: `state.py init` writes both new keys into config.yml."""
     with tempfile.TemporaryDirectory(prefix="laplace-init-") as tmp:
@@ -122,10 +168,12 @@ def test_init_writes_both_new_keys() -> None:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
         assert "max_queue_run:" in text
+        assert "max_parallel:" in text
         assert "merge_policy:" in text
         # And the generated config must itself load without error.
         cfg = state.load_config(target=tmp)
     assert cfg["max_queue_run"] == 5
+    assert cfg["max_parallel"] == 2
     assert cfg["merge_policy"] == "wait-for-human-merge"
 
 
