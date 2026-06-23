@@ -42,6 +42,7 @@ wave outcomes.
 import argparse
 import fnmatch
 import hashlib
+import math
 import os
 import subprocess
 import sys
@@ -83,7 +84,73 @@ IN_FLIGHT_STATUSES = (
 )
 
 # Outcomes that leave the parent log open (waiting for re-invocation).
-_OPEN_OUTCOMES = ("wave-dispatched", "wave-dispatched:waiting")
+# ISSUE-0014: ``wave-deferred:high-load:<ratio>`` is resumable -- the model
+# re-invokes after system load drops, so the parent log must stay open.
+_OPEN_OUTCOMES = ("wave-dispatched", "wave-deferred:high-load")
+
+
+def _is_open_outcome(outcome: Optional[str]) -> bool:
+    """A parent-log outcome is "open" (resumable) when it is None or one of
+    the wave-dispatched / wave-deferred interim outcomes (ISSUE-0014).
+
+    The deferred outcome carries a load ratio suffix, so it is matched by
+    prefix rather than exact equality.
+    """
+    if outcome is None:
+        return True
+    for prefix in _OPEN_OUTCOMES:
+        if outcome == prefix or outcome.startswith(prefix + ":"):
+            return True
+    return False
+
+
+# Module-level one-shot flag for the Windows (no getloadavg) warning so we
+# warn at most once per process (AC-RL-005).
+_LOAD_WARNED = False
+
+
+def _load_headroom(target: Optional[str],
+                   config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Sample pre-dispatch system load and compute the wave's dispatch cap
+    (ISSUE-0014, AC-RL-001..005).
+
+    Returns a dict with:
+      - ``ratio``: float (load1 / cpu_count), or None on Windows.
+      - ``cap``: int effective dispatch cap (0 means defer the wave).
+      - ``deferred``: True when ``cap == 0`` (load at/above load_severe).
+
+    Returns ``None`` when the load check is unavailable (Windows: no
+    ``os.getloadavg``). In that case the caller dispatches at the static
+    ``max_parallel`` (AC-RL-005).
+
+    Headroom rules (AC-RL-002..004):
+      - ratio < load_threshold  -> cap = max_parallel (full, unchanged).
+      - load_threshold <= ratio < load_severe -> reduced cap
+        ``max(1, max_parallel - ceil((ratio - load_threshold) * max_parallel))``.
+      - ratio >= load_severe -> cap = 0 (defer wave).
+    """
+    global _LOAD_WARNED
+    if not hasattr(os, "getloadavg"):
+        if not _LOAD_WARNED:
+            print("parallel: os.getloadavg unavailable on this platform; "
+                  "skipping load check (dispatching at static max_parallel)",
+                  file=sys.stderr)
+            _LOAD_WARNED = True
+        return None
+    cpu = os.cpu_count() or 1
+    load1 = os.getloadavg()[0]
+    ratio = load1 / cpu
+    max_parallel = config["max_parallel"]
+    load_threshold = config.get("load_threshold", 0.7)
+    load_severe = config.get("load_severe", 1.5)
+    if ratio < load_threshold:
+        cap = max_parallel
+    elif ratio < load_severe:
+        cap = max(1, max_parallel - math.ceil(
+            (ratio - load_threshold) * max_parallel))
+    else:
+        cap = 0
+    return {"ratio": ratio, "cap": cap, "deferred": cap == 0}
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +210,8 @@ def _finalize_parent_log(run_id: str, outcome: str,
 def _append_wave(run_id: str, dispatched: List[str], in_flight: List[str],
                  halted: List[str], ready_count: int,
                  target: Optional[str],
-                 overlap_warning: Optional[List[Tuple[str, str, str]]] = None
+                 overlap_warning: Optional[List[Tuple[str, str, str]]] = None,
+                 load_cap: Optional[int] = None,
                  ) -> None:
     log = _load_parent_log(run_id, target)
     if log is None:
@@ -164,6 +232,11 @@ def _append_wave(run_id: str, dispatched: List[str], in_flight: List[str],
              state._redact_evidence(g))
             for (a, b, g) in overlap_warning
         ]
+    # ISSUE-0014 / AC-RL-003: only record ``load_cap`` when the load check
+    # actually reduced the dispatch count below the requested cap, so the
+    # wave entry stays byte-identical to v0.4.0 under low load (AC-RL-007).
+    if load_cap is not None:
+        entry["load_cap"] = load_cap
     log.setdefault("waves", []).append(entry)
     _save_parent_log(log, run_id, target)
 
@@ -245,7 +318,7 @@ def _find_open_parallel_run(target: Optional[str]) \
         if log.get("kind") != "parallel-queue":
             continue
         outcome = log.get("outcome")
-        if outcome is not None and outcome not in _OPEN_OUTCOMES:
+        if not _is_open_outcome(outcome):
             continue
         candidates.append(log)
     if not candidates:
@@ -419,8 +492,46 @@ def _run_parallel_wave(target: Optional[str],
     approved = list(state._load_queue(target).get("approved", []))
 
     in_flight, ready = _compute_sets(approved, halted, target)
-    slots = max(0, max_parallel - len(in_flight))
+
+    # ISSUE-0014: load-aware rate limiter. Sample the system load before
+    # computing ``to_dispatch`` and clamp the dispatch cap to ``load_cap``.
+    # When ``_load_headroom`` returns None (Windows, AC-RL-005) or reports
+    # ``ratio < load_threshold`` (AC-RL-002), the cap equals ``max_parallel``
+    # and the code path below is byte-identical to v0.4.0 (AC-RL-007).
+    headroom = _load_headroom(target, config)
+    load_cap: Optional[int] = None
+    if headroom is not None:
+        load_cap = headroom["cap"]
+        if headroom["deferred"]:
+            # AC-RL-004: ratio >= load_severe. Defer the whole wave:
+            # dispatch nothing, record the wave, leave the parent log open
+            # (resumable), exit 0.
+            ratio = headroom["ratio"]
+            outcome = f"wave-deferred:high-load:{ratio}"
+            _append_wave(parent_run_id, [], in_flight, halted, len(ready),
+                         target)
+            log = _load_parent_log(parent_run_id, target)
+            if log is not None:
+                log["outcome"] = outcome
+                _save_parent_log(log, parent_run_id, target)
+            print(f"parallel: wave deferred (load ratio {ratio} >= "
+                  f"{config.get('load_severe', 1.5)}); re-invoke after load "
+                  f"drops")
+            return parent_run_id, EXIT_OK
+
+    static_slots = max(0, max_parallel - len(in_flight))
+    if load_cap is not None and load_cap < max_parallel:
+        # Reduced cap: clamp by the load-derived cap as well as in-flight.
+        slots = max(0, min(load_cap, max_parallel) - len(in_flight))
+    else:
+        slots = static_slots
     to_dispatch = ready[:slots]
+
+    # AC-RL-003: record ``load_cap`` only when the load check actually reduced
+    # the cap below ``max_parallel``. Under low load (``cap == max_parallel``)
+    # this stays None so the wave entry is byte-identical to v0.4.0 (AC-RL-007).
+    recorded_load_cap: Optional[int] = load_cap if (
+        load_cap is not None and load_cap < max_parallel) else None
 
     # AC-FO-002: advisory file-overlap warning over the ready set. Computed
     # before dispatch; dispatch proceeds regardless of the result.
@@ -436,7 +547,8 @@ def _run_parallel_wave(target: Optional[str],
         in_flight_after, _ready_after = _compute_sets(approved, halted, target)
         _append_wave(parent_run_id, to_dispatch, in_flight_after,
                      halted + halted_new, len(ready), target,
-                     overlap_warning=overlap_warning)
+                     overlap_warning=overlap_warning,
+                     load_cap=recorded_load_cap)
         _finalize_parent_log(parent_run_id, outcome, target)
         print(f"parallel halted: {outcome}")
         return parent_run_id, EXIT_INVALID
@@ -452,7 +564,8 @@ def _run_parallel_wave(target: Optional[str],
 
     _append_wave(parent_run_id, to_dispatch, in_flight_after,
                  halted_after, len(ready), target,
-                 overlap_warning=overlap_warning)
+                 overlap_warning=overlap_warning,
+                 load_cap=recorded_load_cap)
 
     # Outcome decision.
     if not ready_after and not in_flight_after:
@@ -1068,6 +1181,126 @@ def selftest() -> int:
                     "reconcile: finalized parallel-queue ref must be orphan")
         finally:
             shutil.rmtree(rec_tmp, ignore_errors=True)
+
+        # --- Case 8-11: load-aware rate limiter (ISSUE-0014) ------------
+        # Mock os.getloadavg to drive each headroom branch. cpu_count is
+        # monkey-patched so ratios are deterministic across hosts. Each case
+        # uses a fresh parent log: the prior case's open run is finalized
+        # (queue-exhausted) and its locks/child runs cleared so the next
+        # case starts clean (mirrors how the original cases isolate state).
+        def _reset_for_load_case(prefix: str, n: int = 5) -> None:
+            state._save_tasks({}, target=tmp)
+            state._save_queue(state.DEFAULT_QUEUE, target=tmp)
+            # Wipe run logs + locks so prior waves' children don't hold
+            # locks that would make cmd_start fail for re-used issue ids.
+            locks_dir = os.path.join(state._state_dir(tmp), "locks")
+            for d in (state._runs_dir(tmp), locks_dir):
+                if os.path.isdir(d):
+                    for fn in os.listdir(d):
+                        if fn.endswith(".json") or fn.endswith(".lock"):
+                            try:
+                                os.remove(os.path.join(d, fn))
+                            except OSError:
+                                pass
+            for i in range(n):
+                seed_approved(f"ISSUE-{prefix}{i}")
+
+        orig_cpu = os.cpu_count
+        orig_loadavg = getattr(os, "getloadavg", None)
+
+        def _force_load(ratio: float, cpu: int = 4):
+            os.cpu_count = lambda: cpu
+            os.getloadavg = lambda: (ratio * cpu, 0.0, 0.0)
+
+        try:
+            # Case 8: low load (ratio < threshold) -> full cap, no load_cap
+            # recorded, wave entry byte-identical to v0.4.0 (AC-RL-002/007).
+            _reset_for_load_case("L")
+            _force_load(0.1, cpu=4)
+            rid8, rc8 = _run_parallel_wave(tmp, cfg)
+            if rc8 != 0:
+                failures.append(f"case8: low load should exit 0, got {rc8}")
+            log8 = _load_parent_log(rid8, tmp)
+            waves8 = (log8 or {}).get("waves") or []
+            if waves8:
+                if "load_cap" in waves8[-1]:
+                    failures.append(
+                        "case8: low load must NOT record load_cap (AC-RL-007)")
+                if len(waves8[-1].get("dispatched") or []) != 2:
+                    failures.append(
+                        "case8: low load should dispatch full max_parallel=2")
+
+            # Case 9: mid load (threshold <= ratio < severe) -> reduced cap.
+            # max_parallel=2, threshold=0.7, severe=1.5, ratio=1.0 ->
+            # ceil((1.0-0.7)*2)=ceil(0.6)=1 -> cap=max(1,2-1)=1. load_cap=1.
+            _reset_for_load_case("M")
+            _force_load(1.0, cpu=4)
+            rid9, rc9 = _run_parallel_wave(tmp, cfg)
+            if rc9 != 0:
+                failures.append(f"case9: mid load should exit 0, got {rc9}")
+            log9 = _load_parent_log(rid9, tmp)
+            waves9 = (log9 or {}).get("waves") or []
+            if waves9:
+                if waves9[-1].get("load_cap") != 1:
+                    failures.append(
+                        f"case9: expected load_cap=1, got "
+                        f"{waves9[-1].get('load_cap')}")
+                if len(waves9[-1].get("dispatched") or []) != 1:
+                    failures.append(
+                        f"case9: expected 1 dispatched under reduced cap, got "
+                        f"{len(waves9[-1].get('dispatched') or [])}")
+
+            # Case 10: severe load (ratio >= severe) -> defer wave, nothing
+            # dispatched, outcome wave-deferred:high-load:<ratio>, exit 0
+            # (AC-RL-004).
+            _reset_for_load_case("N")
+            _force_load(2.0, cpu=4)
+            rid10, rc10 = _run_parallel_wave(tmp, cfg)
+            if rc10 != 0:
+                failures.append(f"case10: severe load should exit 0, got {rc10}")
+            log10 = _load_parent_log(rid10, tmp)
+            outcome10 = (log10 or {}).get("outcome")
+            if not (isinstance(outcome10, str)
+                    and outcome10.startswith("wave-deferred:high-load:")):
+                failures.append(
+                    f"case10: expected wave-deferred:high-load:<ratio>, got "
+                    f"{outcome10}")
+            waves10 = (log10 or {}).get("waves") or []
+            if waves10 and (waves10[-1].get("dispatched") or []):
+                failures.append(
+                    "case10: severe load must dispatch nothing")
+            # No issue should have left the approved state.
+            for i in range(5):
+                if _read_issue_status(f"ISSUE-N{i}", tmp) != "approved":
+                    failures.append(
+                        f"case10: ISSUE-N{i} must stay approved under severe load")
+            # Parent log stays resumable: _find_open_parallel_run finds it.
+            reopened = _find_open_parallel_run(tmp)
+            if not reopened or reopened.get("run_id") != rid10:
+                failures.append(
+                    "case10: deferred wave must remain resumable (open)")
+
+            # Case 11: severe -> mid transition resumes and dispatches.
+            # Re-invoke the deferred run under mid load: it should now
+            # dispatch at the reduced cap (AC-RL-004 resumability).
+            _force_load(1.0, cpu=4)
+            rid11, rc11 = _run_parallel_wave(tmp, cfg)
+            if rid11 != rid10:
+                failures.append(
+                    "case11: should resume same parent run after load drops")
+            if rc11 != 0:
+                failures.append(f"case11: resumed wave should exit 0, got {rc11}")
+            log11 = _load_parent_log(rid11, tmp)
+            waves11 = (log11 or {}).get("waves") or []
+            if not waves11 or not (waves11[-1].get("dispatched") or []):
+                failures.append(
+                    "case11: resumed wave should dispatch under mid load")
+        finally:
+            os.cpu_count = orig_cpu
+            if orig_loadavg is not None:
+                os.getloadavg = orig_loadavg
+            else:
+                del os.getloadavg
     finally:
         sys.stdout.close()
         sys.stderr.close()
