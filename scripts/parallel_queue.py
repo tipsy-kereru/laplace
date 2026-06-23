@@ -55,6 +55,10 @@ if HERE not in sys.path:
 import state  # noqa: E402
 import runner  # noqa: E402
 import policy  # noqa: ARG001  # noqa: E402  (available for future gate routing)
+# ISSUE-0011: reuse queue_runner's integration->main merge helper so both
+# the serial and parallel queue runners share the same protected-ref guard
+# and policy.check_command routing.
+import queue_runner  # noqa: E402
 
 # Exit codes mirrored from runner.py.
 EXIT_OK = 0
@@ -391,6 +395,11 @@ def _run_parallel_wave(target: Optional[str],
     # Outcome decision.
     if not ready_after and not in_flight_after:
         outcome = "queue-exhausted"
+        # ISSUE-0011: attempt integration -> main merge. Parallel queue does
+        # not stack an integration branch, so _apply_main_merge is a no-op
+        # (skip) there; under a serial auto-merge-branch run that shared the
+        # branch it would advance to main-merged:<sha>.
+        outcome = queue_runner._apply_main_merge(parent_run_id, outcome, target)
         _finalize_parent_log(parent_run_id, outcome, target)
         print(f"parallel: exhausted (no ready, no in-flight)")
         return parent_run_id, EXIT_OK
