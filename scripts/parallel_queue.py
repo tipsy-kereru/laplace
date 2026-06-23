@@ -167,9 +167,42 @@ def _add_halted(run_id: str, issue_id: str,
     if log is None:
         return
     halted = log.setdefault("halted", [])
-    if issue_id not in halted:
-        halted.append(state._redact_evidence(issue_id))
+    safe = state._redact_evidence(issue_id)
+    if safe not in halted:
+        halted.append(safe)
+    # Record when the halt happened so _refresh_halted can drop the entry
+    # if the human re-approves the issue (which bumps tasks[updated_at]).
+    # Security finding 2: without this, a re-approved issue stays stuck.
+    halted_at = log.setdefault("halted_at", {})
+    halted_at[safe] = time.time()
     _save_parent_log(log, run_id, target)
+
+
+def _refresh_halted(log: Dict[str, Any],
+                    target: Optional[str]) -> List[str]:
+    """Drop halted entries whose issue was touched after the halt.
+
+    Re-approve bumps tasks[iid]['updated_at']; if that is newer than the
+    halt-at timestamp, the human resolved the stale branch and re-approved
+    — drop the halt so the issue can dispatch again (security finding 2).
+    Returns the refreshed halted list (also persisted into the log).
+    """
+    halted = list(log.get("halted") or [])
+    halted_at = log.get("halted_at") or {}
+    tasks = state._load_tasks(target)
+    kept: List[str] = []
+    for iid in halted:
+        ts = halted_at.get(iid)
+        rec = tasks.get(iid, {}) if isinstance(tasks, dict) else {}
+        updated = float(rec.get("updated_at") or 0)
+        if ts is not None and updated > float(ts):
+            # Re-approved after halt — drop.
+            continue
+        kept.append(iid)
+    log["halted"] = kept
+    # Clean halted_at to match.
+    log["halted_at"] = {iid: t for iid, t in halted_at.items() if iid in kept}
+    return kept
 
 
 def _find_open_parallel_run(target: Optional[str]) \
@@ -296,7 +329,10 @@ def _run_parallel_wave(target: Optional[str],
         halted: List[str] = []
     else:
         parent_run_id = parent.get("run_id") or _new_parallel_run_id()
-        halted = list(parent.get("halted") or [])
+        # Drop halted entries the human has since re-approved (bumps
+        # tasks[updated_at] past halt-at). Security finding 2.
+        halted = _refresh_halted(parent, target)
+        _save_parent_log(parent, parent_run_id, target)
 
     approved = list(state._load_queue(target).get("approved", []))
 

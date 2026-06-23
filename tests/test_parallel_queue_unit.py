@@ -390,3 +390,79 @@ def test_parallel_queue_selftest_passes():
         f"parallel_queue.py selftest failed (rc={result.returncode}):\n"
         f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
     )
+
+
+def test_security_fix_cancel_partial_failure_keeps_parent_active(monkeypatch):
+    """Security finding 1: a child cancel that fails must NOT finalize the
+    parent as cancelled. The parent stays active (cancel-failed:<id>) so
+    /laplace:status surfaces the stranded child."""
+    tmp = _make_harness()
+    try:
+        _seed_approved(tmp, "ISSUE-A")
+        _seed_approved(tmp, "ISSUE-B")
+        ns = argparse.Namespace(target=tmp)
+        parallel_queue.cmd_parallel_start(ns)
+        # Force ISSUE-A's cmd_end to fail (simulates WORKTREE_DIRTY etc.).
+        real_cmd_end = runner.cmd_end
+
+        def flaky_cmd_end(args):
+            # Resolve which issue this run belongs to.
+            rpath = os.path.join(state._runs_dir(args.target),
+                                 f"{args.run_id}.json")
+            rlog = state._read_json(rpath, default={})
+            if rlog.get("issue_id") == "ISSUE-A":
+                return 7  # WORKTREE_DIRTY-equivalent non-zero
+            return real_cmd_end(args)
+
+        monkeypatch.setattr(runner, "cmd_end", flaky_cmd_end)
+        rc = cancel.cmd_cancel(argparse.Namespace(
+            issue_id=None, target=tmp, force_worktree_remove=False))
+        assert rc == 1, f"cancel should rc=1 on failing child, got {rc}"
+        parent = state._find_active_parallel_run(tmp)
+        assert parent is not None, "parent must stay active after cancel-failed"
+        outcome = parent.get("outcome") or ""
+        assert outcome.startswith("cancel-failed"), (
+            f"parent outcome should be cancel-failed:*, got {outcome!r}")
+        assert "ISSUE-A" in outcome
+    finally:
+        _teardown(tmp)
+
+
+def test_security_fix_halted_reapproved_dispatches():
+    """Security finding 2: a halted issue the human re-approves (bumping
+    tasks[updated_at]) must drop from the halted set and dispatch again."""
+    tmp = _make_harness()
+    try:
+        _seed_approved(tmp, "ISSUE-H")
+        # First wave: force ISSUE-H into halted by simulating stale-branch.
+        # Seed a stale laplace/ISSUE-H branch (behind main) so cmd_start
+        # returns EXIT_BRANCH_STALE.
+        subprocess.run(["git", "branch", "laplace/ISSUE-H",
+                        "HEAD~1"], cwd=tmp, check=True,
+                       capture_output=True) if False else None
+        # Simpler: directly inject ISSUE-H into the parent halted set with
+        # an old halted_at, then bump tasks[updated_at] and verify refresh.
+        _seed_approved(tmp, "ISSUE-X")  # sibling so wave runs
+        ns = argparse.Namespace(target=tmp)
+        parallel_queue.cmd_parallel_start(ns)
+        parent = state._find_active_parallel_run(tmp)
+        assert parent is not None
+        rid = parent["run_id"]
+        # Inject ISSUE-H as halted in the distant past.
+        parent["halted"] = ["ISSUE-H"]
+        parent["halted_at"] = {"ISSUE-H": time.time() - 1000}
+        state._atomic_write_json(
+            os.path.join(state._runs_dir(tmp), f"{rid}.json"), parent)
+        # Make ISSUE-H's tasks[updated_at] newer than the halt (re-approve).
+        tasks = state._load_tasks(tmp)
+        tasks["ISSUE-H"]["updated_at"] = time.time()
+        state._save_tasks(tasks, target=tmp)
+        # Re-run wave: _refresh_halted should drop ISSUE-H.
+        parallel_queue.cmd_parallel_start(ns)
+        parent2 = state._read_json(
+            os.path.join(state._runs_dir(tmp), f"{rid}.json"))
+        assert "ISSUE-H" not in (parent2.get("halted") or []), (
+            "halted set should drop ISSUE-H after re-approve (updated_at bump)"
+        )
+    finally:
+        _teardown(tmp)

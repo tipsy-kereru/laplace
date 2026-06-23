@@ -705,7 +705,11 @@ def _find_active_parallel_run(target: Optional[str] = None) \
             continue
         outcome = log.get("outcome")
         if outcome is not None and outcome not in (
-                "wave-dispatched", "wave-dispatched:waiting"):
+                "wave-dispatched", "wave-dispatched:waiting") \
+                and not (isinstance(outcome, str)
+                         and outcome.startswith("cancel-failed")):
+            # cancel-failed:* keeps the run ACTIVE so /laplace:status
+            # surfaces stranded children (security finding 1/3).
             continue
         candidates.append(log)
     if not candidates:

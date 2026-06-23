@@ -139,20 +139,29 @@ def _parallel_in_flight_child_runs(log: Dict[str, Any],
     return out
 
 
-def _finalize_parallel_cancel(run_id: str, target: Optional[str]) \
+def _finalize_parallel_cancel(run_id: str, target: Optional[str],
+                              outcome: str = "cancelled") \
         -> Optional[Dict[str, Any]]:
-    """Finalize the active parallel parent log as cancelled.
+    """Finalize the active parallel parent log.
 
-    Sets ``outcome`` to ``cancelled`` and bumps ``ended_at``. Records the
-    wave position for resume by leaving the ``waves`` array intact. Writes
-    atomically. Returns the rewritten log, or None if missing/malformed.
+    Sets ``outcome`` (default ``cancelled``; pass ``cancel-failed:<id>``
+    when a child teardown failed so the parent stays in the active set for
+    /laplace:status to surface). Bumps ``ended_at`` only when outcome is
+    terminal (cancelled); a cancel-failed outcome leaves ended_at null so
+    the run remains active. Writes atomically. Returns the rewritten log,
+    or None if missing/malformed.
     """
     path = os.path.join(state._runs_dir(target), f"{run_id}.json")
     log = state._read_json(path, default=None)
     if not isinstance(log, dict):
         return None
-    log["outcome"] = state._redact_evidence("cancelled")
-    log["ended_at"] = time.time()
+    log["outcome"] = state._redact_evidence(outcome)
+    if outcome == "cancelled":
+        log["ended_at"] = time.time()
+    else:
+        # cancel-failed: keep the run ACTIVE so status surfaces the
+        # stranded children. The human resolves each then re-runs cancel.
+        log["ended_at"] = None
     state._atomic_write_json(path, log)
     return log
 
@@ -253,23 +262,42 @@ def cmd_cancel(args: argparse.Namespace) -> int:
         p_run_id = parallel.get("run_id") or ""
         children = _parallel_in_flight_child_runs(parallel, target)
         cancelled_issues: List[str] = []
+        failed_children: List[str] = []
         for issue_id, child_run_id in children:
             rc = runner.cmd_end(argparse.Namespace(
                 run_id=child_run_id, outcome="cancelled", evidence=None,
                 target=target))
             if rc != 0:
-                # Surface the child failure but continue tearing down the
-                # rest (best-effort cancel). The parent log is still
-                # finalized below so it drops out of the active set.
+                # Child teardown failed (e.g. WORKTREE_DIRTY). Do NOT
+                # discard — record the strand and keep the parent ACTIVE
+                # (cancel-failed outcome) so /laplace:status surfaces it.
+                # The human resolves the child (force-remove or manual),
+                # then re-runs /laplace:cancel.
+                failed_children.append(issue_id)
                 print(f"warning: child cancel failed for {issue_id} "
-                      f"(rc={rc})", file=sys.stderr)
+                      f"(rc={rc}); stranded — resolve then re-run cancel",
+                      file=sys.stderr)
             else:
                 _set_issue_cancelled(issue_id, child_run_id, target)
                 runner._append_run_history_to_issue(
                     issue_id=issue_id,
                     line=f"parallel-cancel: {child_run_id} -> cancelled",
                     target=target)
-            cancelled_issues.append(issue_id)
+                cancelled_issues.append(issue_id)
+        # TOCTOU guard: a new child may have appeared between the snapshot
+        # and now. Re-read; any remaining in-flight is treated as a strand.
+        remaining = _parallel_in_flight_child_runs(parallel, target)
+        stranded_ids = [iid for iid, _ in remaining]
+        if failed_children or stranded_ids:
+            stranders = sorted(set(failed_children) | set(stranded_ids))
+            token = ",".join(stranders)
+            _finalize_parallel_cancel(p_run_id, target,
+                                      outcome=f"cancel-failed:{token}")
+            print("Parallel cancel INCOMPLETE — parent left active.", file=sys.stderr)
+            print(f"  Stranded: {', '.join(stranders)}", file=sys.stderr)
+            print("  Resolve each (e.g. /laplace:cancel <id> --force-worktree-remove) "
+                  "then re-run /laplace:cancel.", file=sys.stderr)
+            return 1
         rewritten = _finalize_parallel_cancel(p_run_id, target)
         if rewritten is None:
             print(f"parallel run log not found: {p_run_id}", file=sys.stderr)
