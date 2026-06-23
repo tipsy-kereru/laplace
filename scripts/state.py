@@ -30,6 +30,7 @@ MAX_FILES_CHANGED_WITHOUT_APPROVAL = 20
 MAX_DIFF_LINES_WITHOUT_APPROVAL = 1000
 MAX_STOP_HOOK_ITERATIONS = 12
 MAX_QUEUE_RUN = 5
+MAX_PARALLEL = 2
 
 DEFAULT_MERGE_POLICY = "wait-for-human-merge"
 VALID_MERGE_POLICIES = {"wait-for-human-merge", "auto-merge-branch"}
@@ -342,6 +343,7 @@ limits:
   max_diff_lines_without_approval: %d
   max_stop_hook_iterations: %d
   max_queue_run: %d
+  max_parallel: %d
 policy:
   require_approval_for:
     - git_push
@@ -365,6 +367,7 @@ redaction:
     MAX_DIFF_LINES_WITHOUT_APPROVAL,
     MAX_STOP_HOOK_ITERATIONS,
     MAX_QUEUE_RUN,
+    MAX_PARALLEL,
     DEFAULT_MERGE_POLICY,
 )
 
@@ -582,6 +585,22 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
                   file=sys.stderr)
             sys.exit(2)
 
+    # max_parallel: int, default 2, must be positive (ISSUE-0004).
+    raw_parallel = limits.get("max_parallel")
+    if raw_parallel is None or raw_parallel == "":
+        max_parallel = MAX_PARALLEL
+    else:
+        try:
+            max_parallel = int(raw_parallel)
+        except ValueError:
+            print(f"invalid max_parallel (not an int): {raw_parallel!r}",
+                  file=sys.stderr)
+            sys.exit(2)
+        if max_parallel <= 0:
+            print(f"invalid max_parallel (must be positive int): {max_parallel}",
+                  file=sys.stderr)
+            sys.exit(2)
+
     # merge_policy: enum, default wait-for-human-merge.
     merge_policy = policy.get("merge_policy") or DEFAULT_MERGE_POLICY
     if merge_policy not in VALID_MERGE_POLICIES:
@@ -591,6 +610,7 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
 
     return {
         "max_queue_run": max_queue_run,
+        "max_parallel": max_parallel,
         "merge_policy": merge_policy,
     }
 
@@ -659,6 +679,76 @@ def _resumable_queue_current_issue(log: Dict[str, Any],
     return "?"
 
 
+def _find_active_parallel_run(target: Optional[str] = None) \
+        -> Optional[Dict[str, Any]]:
+    """Find the most-recent active parallel-run log under .harness/state/runs/.
+
+    A parallel-run log (ISSUE-0004) is "active" when it is not finalized:
+    ``kind == "parallel-queue"`` AND ``outcome`` is None or a wave-dispatched
+    interim outcome (``wave-dispatched`` or ``wave-dispatched:waiting``).
+    Finalized outcomes (``queue-exhausted``, ``cancelled``, ``start-failed:*``)
+    are inactive. Returns the most recent by ``started_at``, or None.
+
+    Used by ``_format_status`` (AC-PQ-009) and ``cancel`` (AC-PQ-010).
+    """
+    runs_dir = _runs_dir(target)
+    if not os.path.isdir(runs_dir):
+        return None
+    candidates: List[Dict[str, Any]] = []
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = _read_json(os.path.join(runs_dir, name), default=None)
+        if not isinstance(log, dict):
+            continue
+        if log.get("kind") != "parallel-queue":
+            continue
+        outcome = log.get("outcome")
+        if outcome is not None and outcome not in (
+                "wave-dispatched", "wave-dispatched:waiting") \
+                and not (isinstance(outcome, str)
+                         and outcome.startswith("cancel-failed")):
+            # cancel-failed:* keeps the run ACTIVE so /laplace:status
+            # surfaces stranded children (security finding 1/3).
+            continue
+        candidates.append(log)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda l: float(l.get("started_at") or 0.0),
+        reverse=True)
+    return candidates[0]
+
+
+def _parallel_in_flight_pairs(log: Dict[str, Any],
+                              target: Optional[str] = None) \
+        -> List[Tuple[str, str]]:
+    """Return (issue_id, worktree_path) pairs for in-flight children.
+
+    In-flight = the child run's issue is in a non-terminal status (matches
+    the scheduler's in_flight set). Reads each child run log for its
+    ``issue_id`` and ``worktree_path``. Pairs with a missing worktree path
+    fall back to "(no worktree)".
+    """
+    tasks = _load_tasks(target)
+    runs_dir = _runs_dir(target)
+    pairs: List[Tuple[str, str]] = []
+    for child_id in (log.get("issues") or []):
+        child_path = os.path.join(runs_dir, f"{child_id}.json")
+        child = _read_json(child_path, default=None)
+        if not isinstance(child, dict):
+            continue
+        issue_id = child.get("issue_id")
+        if not isinstance(issue_id, str) or not issue_id:
+            continue
+        status = tasks.get(issue_id, {}).get("status")
+        if status in TERMINAL_STATES:
+            continue
+        wt = child.get("worktree_path") or "(no worktree)"
+        pairs.append((issue_id, wt))
+    return pairs
+
+
 def _format_status(target: Optional[str] = None) -> str:
     tasks = _load_tasks(target)
     queue = _load_queue(target)
@@ -708,6 +798,25 @@ def _format_status(target: Optional[str] = None) -> str:
         lines.append(
             f"  merge policy: {resumable.get('merge_policy', '?')}")
         lines.append(f"  consecutive: {step}")
+    # Active parallel-run block (ISSUE-0004, AC-PQ-009). Only emitted when
+    # an active (non-finalized) parallel-queue log exists, so the output is
+    # byte-identical when no parallel run is active (AC-PQ-011).
+    parallel = _find_active_parallel_run(target)
+    if parallel is not None:
+        waves = parallel.get("waves") or []
+        wave_count = len(waves)
+        in_flight_pairs = _parallel_in_flight_pairs(parallel, target)
+        halted = parallel.get("halted") or []
+        lines.append("")
+        lines.append("Parallel run:")
+        lines.append(f"  run id: {parallel.get('run_id', '?')}")
+        lines.append(f"  wave: {wave_count}")
+        lines.append(f"  in-flight: {len(in_flight_pairs)}")
+        for iid, wt in in_flight_pairs:
+            lines.append(f"    {iid} @ {wt}")
+        lines.append(f"  halted: {len(halted)}")
+        if halted:
+            lines.append(f"    {', '.join(halted)}")
     lines.append("")
     lines.append("Next action:")
     if queue.get("approved") and not active_run:
@@ -1140,7 +1249,8 @@ def selftest() -> int:
         for limit in ["max_fix_attempts", "max_pm_clarification_attempts",
                       "max_security_fix_attempts", "max_runtime_minutes_per_issue",
                       "max_files_changed_without_approval", "max_diff_lines_without_approval",
-                      "max_stop_hook_iterations", "max_queue_run", "merge_policy"]:
+                      "max_stop_hook_iterations", "max_queue_run", "max_parallel",
+                      "merge_policy"]:
             if limit not in cfg_text:
                 failures.append(f"config.yml missing {limit}")
 
