@@ -208,6 +208,16 @@ def _print_parallel_result(run_id: str, cancelled_issues: List[str],
     print(f"  /laplace:run-parallel  (starts fresh wave from approved queue)")
 
 
+def _print_pipeline_result(run_id: str, phase: str) -> None:
+    print("Cancelled pipeline run.")
+    print(f"  Pipeline run: {run_id}")
+    print(f"  Phase at cancel: {phase}")
+    print(f"  Outcome: cancelled")
+    print(f"\nNext:")
+    print(f"  /laplace:status  (Pipeline: block is gone)")
+    print(f"  /laplace:pipeline <prd>  (starts a fresh pipeline)")
+
+
 def cmd_cancel(args: argparse.Namespace) -> int:
     target = getattr(args, "target", None)
     issue_arg = getattr(args, "issue_id", None)
@@ -316,6 +326,22 @@ def cmd_cancel(args: argparse.Namespace) -> int:
             return 1
         merge_waited = state._resumable_queue_current_issue(resumable, target)
         _print_queue_result(q_run_id, merge_waited, target)
+        return 0
+
+    # Path 2c: active pipeline log (ISSUE-0005). Inserted AFTER the
+    # parallel-run path (2b) so the parallel run tears down first; a second
+    # /laplace:cancel then finalizes the pipeline log. Does NOT touch issues
+    # (AC-PL-010): in-flight children were cancelled via the parallel path,
+    # and individual issues keep their state for audit.
+    pipeline = state._find_active_pipeline_run(target)
+    if pipeline is not None:
+        p_run_id = pipeline.get("run_id") or ""
+        pipeline["outcome"] = "cancelled"
+        pipeline["ended_at"] = time.time()
+        state._atomic_write_json(
+            os.path.join(state._runs_dir(target), f"{p_run_id}.json"),
+            pipeline)
+        _print_pipeline_result(p_run_id, pipeline.get("phase", "?"))
         return 0
 
     # Path 4: nothing to cancel.

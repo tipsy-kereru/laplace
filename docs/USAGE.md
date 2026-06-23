@@ -255,6 +255,67 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 
 ---
 
+## Use case 7 — Pipeline: one command for the whole flow
+
+Scenario: you want the maintainer's "take this PRD and run it to a release" path. `/laplace:pipeline` chains intake, verify, approve, run-parallel, and release into a single checkpoint pipeline. It does NOT skip any gate — every gate still halts for a human decision. It only removes the keystroke choreography between gates.
+
+### Step 1 — Kick off the pipeline
+
+```
+/laplace:pipeline docs/prd-login-rate-limit.md
+```
+
+The pipeline runs intake + verify, then halts at the **approve-gate** with the verify report and a per-issue risk table:
+
+```
+Pipeline halt: approve-gate:ISSUE-0001=medium,ISSUE-0002=low
+  Phase: approve-gate
+  Drafts (issue=risk): ISSUE-0001=medium,ISSUE-0002=low
+  Next: review the verify report above, then re-run /laplace:pipeline --resume to batch-approve all drafts.
+```
+
+### Step 2 — Review the gate, then resume
+
+Read the verify report (PASS/WARN) and the per-issue risk summary. If you accept them all, resume — the pipeline batch-approves every draft in one step:
+
+```
+/laplace:pipeline --resume
+```
+
+The pipeline then advances to the **parallel** phase, dispatching the first wave of approved issues. It halts again on `parallel:wave-dispatched:waiting` (drive in-flight issues to terminal) or `parallel:merge-wait:<id>` (a per-issue merge gate).
+
+### Step 3 — Release gate
+
+After the parallel phase reaches `queue-exhausted`, the pipeline halts at the **release-gate**:
+
+```
+Pipeline halt: release-gate
+  Phase: release-gate
+  Next: /laplace:release <X.Y.Z>  (or re-run /laplace:pipeline --release <X.Y.Z> --resume)
+```
+
+Either invoke `/laplace:release 0.5.0` separately, or pass `--release 0.5.0` and resume to have the pipeline call release (its 8-check gate still fires unchanged).
+
+### Flags
+
+- `--auto-approve-low-risk` — auto-approve drafts whose Risk Level is `low` at the approve-gate; halt if any draft is medium+. Default OFF (the approve gate always halts).
+- `--release <X.Y.Z>` — at the release-gate (after queue-exhausted, no halted issues), call `/laplace:release` instead of halting.
+- `--max-parallel N` — override `.harness/config.yml` `limits.max_parallel`.
+- `--force-verify` — escape hatch to proceed past a verify FAIL.
+- `--resume` — explicitly resume from the recorded phase (re-invoking with the same PRD path also resumes implicitly).
+
+### Cancel a pipeline
+
+```
+/laplace:cancel
+```
+
+If an active parallel run exists, the first cancel tears it down; a second cancel finalizes the pipeline log as `cancelled`. Cancel does NOT touch individual issues — they keep their state for audit.
+
+`/laplace:status` reports the active pipeline (phase, prd, draft/approved/in-flight counts) so you always know where you are.
+
+---
+
 ## Command reference (quick)
 
 | Command | When |
@@ -267,6 +328,7 @@ The runner continues with ISSUE-0006, then ISSUE-0007, and finally prints `queue
 | `/laplace:discard <issue>` | A draft was created by mistake and should not exist (draft-only) |
 | `/laplace:run [issue]` | Execute or resume a loop |
 | `/laplace:run-queue [issue]` | Multiple issues approved, want them run in order |
+| `/laplace:pipeline <prd>` | Drive a PRD end-to-end with one command — halts at every gate, resumes on re-invocation |
 | `/laplace:status` | Check queue, active run, blockers |
 | `/laplace:report <issue>` | Review sanitized evidence and verdicts |
 | `/laplace:cancel [issue]` | Stop a loop safely (keeps state) |
