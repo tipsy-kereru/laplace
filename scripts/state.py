@@ -16,9 +16,15 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+# ISSUE-0013: policy.check_command for the orphan-worktree git probe in
+# _count_orphan_worktrees. policy.py has no laplace-internal imports so this
+# is non-circular.
+import policy  # noqa: E402
 
 # --- Loop limit constants (G-LP-004). Mirror policy.py and config.yml template. -
 
@@ -810,6 +816,89 @@ def _parallel_in_flight_pairs(log: Dict[str, Any],
     return pairs
 
 
+def _count_orphan_worktrees(target: Optional[str] = None) -> int:
+    """Count worktrees on disk with no live (non-finalized) run-log reference.
+
+    ISSUE-0013 AC-OW-003. Inline in state.py to avoid a circular import on
+    parallel_queue (which imports state). "Live" mirrors the definition in
+    ``parallel_queue._collect_worktree_refs``: a run log with ``ended_at`` is
+    None AND (``outcome`` is None or an open interim parallel-queue outcome).
+
+    Returns 0 when the repo is not a git work tree, when git/policy denies the
+    ``git worktree list --porcelain`` probe, or when there are simply no
+    orphans — so the status output is byte-identical in all those cases.
+    """
+    runs_dir = _runs_dir(target)
+    # Map normpath(worktree_path) -> is_live (True if ANY non-finalized ref).
+    refs: Dict[str, bool] = {}
+    if os.path.isdir(runs_dir):
+        for name in os.listdir(runs_dir):
+            if not name.endswith(".json"):
+                continue
+            log = _read_json(os.path.join(runs_dir, name), default=None)
+            if not isinstance(log, dict):
+                continue
+            wt = log.get("worktree_path")
+            if not isinstance(wt, str) or not wt:
+                continue
+            outcome = log.get("outcome")
+            is_open_parallel = (
+                log.get("kind") == "parallel-queue"
+                and (outcome is None
+                     or (isinstance(outcome, str)
+                         and outcome.startswith("wave-dispatched")))
+            )
+            is_live = (log.get("ended_at") is None) and (
+                outcome is None or is_open_parallel)
+            key = os.path.normpath(wt)
+            refs[key] = refs.get(key, False) or is_live
+    # Probe worktrees on disk via git (policy-checked). Fail safe (return 0)
+    # if git is unavailable or the command is policy-denied.
+    probe = "git rev-parse --git-dir"
+    ok_probe, _ = policy.check_command(probe)
+    if not ok_probe:
+        return 0
+    try:
+        in_tree = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=target or os.getcwd(),
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0
+    if in_tree.returncode != 0:
+        return 0
+    list_cmd = "git worktree list --porcelain"
+    ok, _reason = policy.check_command(list_cmd)
+    if not ok:
+        return 0
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=target or os.getcwd(),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return 0
+    if r.returncode != 0:
+        return 0
+    # Restrict to Laplace-managed worktrees (runner._worktree_path puts them
+    # under <target>/.harness/worktrees/<id>/). The main repo worktree and any
+    # foreign worktrees are excluded so the status count reflects only orphans
+    # Laplace could reconcile.
+    wt_root = os.path.normpath(
+        os.path.join(_harness_root(target), ".harness", "worktrees"))
+    orphan = 0
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            key = os.path.normpath(line[len("worktree "):].strip())
+            if key != wt_root and not key.startswith(wt_root + os.sep):
+                continue
+            if not refs.get(key, False):
+                orphan += 1
+    return orphan
+
+
 def _format_status(target: Optional[str] = None) -> str:
     tasks = _load_tasks(target)
     queue = _load_queue(target)
@@ -923,6 +1012,14 @@ def _format_status(target: Optional[str] = None) -> str:
         lines.append(f"  approved: {approved}")
         lines.append(f"  in-flight: {in_flight_p}")
         lines.append(f"  merge-waited: {merge_waited}")
+    # AC-OW-003 (ISSUE-0013): orphan worktree count. Only emitted when
+    # non-zero, so the status output is byte-identical to the pre-change
+    # baseline when there are no orphans (characterization preserved).
+    orphan_count = _count_orphan_worktrees(target)
+    if orphan_count:
+        lines.append("")
+        lines.append(f"Orphan worktrees: {orphan_count}")
+        lines.append("  /laplace:reconcile-worktrees")
     lines.append("")
     lines.append("Next action:")
     if queue.get("approved") and not active_run:
