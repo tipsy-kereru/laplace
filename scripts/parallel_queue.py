@@ -43,6 +43,7 @@ import argparse
 import fnmatch
 import hashlib
 import os
+import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -490,6 +491,242 @@ def cmd_parallel_start(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Orphan worktree reconcile (ISSUE-0013)
+# ---------------------------------------------------------------------------
+#
+# Security finding 4 (low): a crash between `git worktree add` and parent-log
+# append leaves a worktree on disk with no live run-log reference. `git worktree
+# prune` only removes worktrees whose DIRECTORY is gone, not the reverse, so it
+# does NOT recover this case. This command scans run logs for `worktree_path`
+# and reconciles against `git worktree list --porcelain`.
+#
+# Category rules (AC-OW-001..004):
+#   - live           : on disk AND some NON-finalized run log references it.
+#                      NEVER touched (AC-OW-002).
+#   - orphan         : on disk AND only FINALIZED run log(s) reference it.
+#                      Recoverable: the issue_id is read from the most-recent
+#                      finalized log. Sweepable with --sweep.
+#   - manual recovery: on disk AND NO run log references it at all (the log
+#                      is missing/corrupt). Reported, NEVER auto-swept (AC-OW-004).
+
+def _collect_worktree_refs(target: Optional[str]) \
+        -> Dict[str, List[Tuple[str, bool, str]]]:
+    """Map worktree_path -> list of (run_id, is_live, issue_id).
+
+    Scans EVERY ``.harness/state/runs/*.json`` (parent parallel-queue logs AND
+    single-issue child logs) for a top-level ``worktree_path``. A reference is
+    "live" when the referencing log is non-finalized (``ended_at`` is None AND
+    ``outcome`` is None or an open interim outcome).
+    """
+    runs_dir = state._runs_dir(target)
+    refs: Dict[str, List[Tuple[str, bool, str]]] = {}
+    if not os.path.isdir(runs_dir):
+        return refs
+    for name in os.listdir(runs_dir):
+        if not name.endswith(".json"):
+            continue
+        log = state._read_json(os.path.join(runs_dir, name), default=None)
+        if not isinstance(log, dict):
+            continue
+        wt = log.get("worktree_path")
+        if not isinstance(wt, str) or not wt:
+            continue
+        outcome = log.get("outcome")
+        ended_at = log.get("ended_at")
+        # Open interim outcomes on parent logs (wave-dispatched*) keep children
+        # live even before ended_at is set.
+        is_open_parallel = (
+            log.get("kind") == "parallel-queue"
+            and (outcome is None
+                 or (isinstance(outcome, str)
+                     and outcome.startswith("wave-dispatched")))
+        )
+        is_live = (ended_at is None) and (
+            outcome is None or is_open_parallel
+        )
+        issue_id = log.get("issue_id")
+        if not isinstance(issue_id, str):
+            issue_id = ""
+        refs.setdefault(wt, []).append(
+            (log.get("run_id") or name[:-5], is_live, issue_id))
+    return refs
+
+
+def _git_worktree_list(target: Optional[str]) -> List[str]:
+    """Return absolute worktree paths known to git.
+
+    Runs ``git worktree list --porcelain`` (routed through
+    policy.check_command) and parses the ``worktree <path>`` stanzas. Returns
+    ``[]`` when git is unavailable or the command is policy-denied (fail-safe:
+    nothing to reconcile against, so the command reports zero orphans and
+    exits 0).
+    """
+    if not runner._in_git_repo(target):
+        return []
+    list_cmd = "git worktree list --porcelain"
+    ok, _reason = policy.check_command(list_cmd)
+    if not ok:
+        return []
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=target or os.getcwd(),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    paths: List[str] = []
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            paths.append(line[len("worktree "):].strip())
+    return paths
+
+
+def _classify_worktrees(target: Optional[str]) -> Tuple[List[Dict[str, Any]],
+                                                       List[Dict[str, Any]],
+                                                       List[str]]:
+    """Return (orphans, manual, live_paths).
+
+    Each orphan/manual entry is a dict ``{path, issue_id, run_id}``. For
+    orphans the issue_id/run_id come from the most-recent finalized log that
+    referenced the path (started_at tie-break). Manual entries have an empty
+    issue_id (no log to recover from).
+
+    Only Laplace-managed worktrees (those living under
+    ``<target>/.harness/worktrees/``) are considered. The repo's main
+    worktree and any foreign worktrees are excluded so reconcile never
+    reports or sweeps them.
+    """
+    refs = _collect_worktree_refs(target)
+    on_disk = _git_worktree_list(target)
+    # Restrict to Laplace-managed worktrees (runner._worktree_path puts them
+    # under <target>/.harness/worktrees/<id>/). The main repo worktree and
+    # any foreign worktrees are never orphans from Laplace's perspective.
+    wt_root = os.path.normpath(
+        os.path.join(state._harness_root(target), ".harness", "worktrees"))
+    on_disk = [p for p in on_disk
+               if os.path.normpath(p).startswith(wt_root + os.sep)
+               or os.path.normpath(p) == wt_root]
+
+    orphans: List[Dict[str, Any]] = []
+    manual: List[Dict[str, Any]] = []
+    live_paths: List[str] = []
+
+    # First pass: classify every referenced path.
+    refs_norm: Dict[str, List[Tuple[str, bool, str]]] = {}
+    for wt, entries in refs.items():
+        refs_norm[os.path.normpath(wt)] = entries
+
+    for path in on_disk:
+        norm = os.path.normpath(path)
+        entries = refs_norm.get(norm)
+        if not entries:
+            # On disk, no run log references it -> manual recovery (AC-OW-004).
+            manual.append({"path": path, "issue_id": "", "run_id": ""})
+            continue
+        any_live = any(e[1] for e in entries)
+        if any_live:
+            live_paths.append(path)
+            continue
+        # Only finalized references -> orphan. Recover issue_id from the
+        # most-recent referencing log (heuristic: last in scan order).
+        rid = entries[-1][0]
+        iid = ""
+        for _rid, _live, cand in reversed(entries):
+            if cand:
+                iid = cand
+                break
+        orphans.append({"path": path, "issue_id": iid, "run_id": rid})
+
+    return orphans, manual, live_paths
+
+
+def _reconcile_report(orphans: List[Dict[str, Any]],
+                      manual: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    if orphans:
+        lines.append(f"Orphan worktrees ({len(orphans)}):")
+        for e in orphans:
+            iid = e["issue_id"] or "?"
+            lines.append(f"  {e['path']} (last issue: {iid})")
+    if manual:
+        lines.append(f"Manual recovery ({len(manual)}):")
+        for e in manual:
+            lines.append(
+                f"  {e['path']} (no run log; remove manually if safe)")
+    if not orphans and not manual:
+        lines.append("No orphan worktrees.")
+    return lines
+
+
+def _remove_worktree(path: str, target: Optional[str]) -> Tuple[bool, str]:
+    """`git worktree remove --force <path>` (policy-checked)."""
+    rm_cmd = f"git worktree remove --force {path}"
+    ok, reason = policy.check_command(rm_cmd)
+    if not ok:
+        return False, f"policy-denied: {reason}"
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "remove", "--force", path],
+            cwd=state._harness_root(target),
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"git-error: {exc}"
+    if r.returncode != 0:
+        return False, f"git-error: {(r.stderr or '').strip()}"
+    return True, "removed"
+
+
+def cmd_reconcile_worktrees(args: argparse.Namespace) -> int:
+    """List and optionally sweep orphan worktrees (AC-OW-001..004)."""
+    target = getattr(args, "target", None)
+    sweep = bool(getattr(args, "sweep", False))
+    yes = bool(getattr(args, "yes", False))
+
+    orphans, manual, live_paths = _classify_worktrees(target)
+
+    for line in _reconcile_report(orphans, manual):
+        print(line)
+
+    if not sweep:
+        return 0
+
+    if not orphans:
+        # Nothing sweepable. Manual entries are never auto-swept (AC-OW-004).
+        return 0
+
+    # Confirmation prompt unless --yes.
+    if not yes:
+        print("")
+        print(f"About to remove {len(orphans)} orphan worktree(s):")
+        for e in orphans:
+            print(f"  {e['path']}")
+        try:
+            answer = input("Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("aborted")
+            return 1
+
+    removed = 0
+    failures: List[str] = []
+    for e in orphans:
+        ok, reason = _remove_worktree(e["path"], target)
+        if ok:
+            removed += 1
+        else:
+            failures.append(f"{e['path']}: {reason}")
+    print(f"swept {removed} orphan worktree(s)")
+    for f in failures:
+        print(f"  failed: {f}", file=sys.stderr)
+    return 0 if not failures else 1
+
+
+# ---------------------------------------------------------------------------
 # selftest
 # ---------------------------------------------------------------------------
 
@@ -721,6 +958,116 @@ def selftest() -> int:
             failures.append(
                 f"case7: empty approved should be queue-exhausted, got "
                 f"{log7.get('outcome') if log7 else None}")
+
+        # --- Reconcile (ISSUE-0013): pure-logic classification cases -------
+        # These exercise _collect_worktree_refs + _classify_worktrees with
+        # synthetic run logs (no git required); the git-side helpers are
+        # covered by the pytest unit suite using a real repo.
+        rec_tmp = tempfile.mkdtemp(prefix="laplace-reconcile-selftest-")
+        try:
+            assert state.cmd_init(target=rec_tmp) == 0
+            runs = state._runs_dir(rec_tmp)
+
+            def _write_log(run_id, *, kind="single", issue_id="",
+                           worktree_path=None, outcome=None,
+                           ended_at=None, started_at=None):
+                log = {
+                    "run_id": run_id,
+                    "kind": kind,
+                    "issue_id": issue_id,
+                    "started_at": started_at if started_at is not None
+                    else time.time(),
+                    "ended_at": ended_at,
+                    "outcome": outcome,
+                    "worktree_path": worktree_path,
+                }
+                state._atomic_write_json(
+                    os.path.join(runs, f"{run_id}.json"), log)
+                return log
+
+            # AC-OW-002: live child log (non-finalized) -> live, never swept.
+            wt_base = os.path.join(
+                state._harness_root(rec_tmp), ".harness", "worktrees")
+            live_path = os.path.join(wt_base, "wt-live")
+            _write_log("c-live", issue_id="ISSUE-LIVE",
+                       worktree_path=live_path, outcome=None, ended_at=None)
+            # Orphan: finalized child log (ended_at set) -> recoverable.
+            orph_path = os.path.join(wt_base, "wt-orph")
+            _write_log("c-orph", issue_id="ISSUE-ORPH",
+                       worktree_path=orph_path, outcome="blocked",
+                       ended_at=time.time())
+            # Manual recovery: no run log references this path at all.
+            manual_path = os.path.join(wt_base, "wt-manual")
+            # Open parallel parent log referencing a child path is live.
+            par_path = os.path.join(wt_base, "wt-par")
+            _write_log("p-open", kind="parallel-queue",
+                       worktree_path=par_path, outcome=None, ended_at=None)
+
+            # Monkey-patch _git_worktree_list to return our synthetic on-disk
+            # set so classification is testable without a real git repo.
+            disk = [live_path, orph_path, manual_path, par_path,
+                    os.path.join(wt_base, "wt-extra-no-log")]
+            orig_list = _git_worktree_list
+
+            def fake_list(t, _disk=disk):
+                return list(_disk)
+
+            globals()["_git_worktree_list"] = fake_list
+            try:
+                orphans, manual, live = _classify_worktrees(rec_tmp)
+            finally:
+                globals()["_git_worktree_list"] = orig_list
+
+            live_set = {os.path.normpath(p) for p in live}
+            if os.path.normpath(live_path) not in live_set:
+                failures.append(
+                    "reconcile: live (non-finalized) child must be live")
+            if os.path.normpath(par_path) not in live_set:
+                failures.append(
+                    "reconcile: open parallel parent ref must be live")
+            orph_paths = {os.path.normpath(e["path"]) for e in orphans}
+            if os.path.normpath(orph_path) not in orph_paths:
+                failures.append("reconcile: finalized-only ref must be orphan")
+            else:
+                entry = next(e for e in orphans
+                             if os.path.normpath(e["path"])
+                             == os.path.normpath(orph_path))
+                if entry["issue_id"] != "ISSUE-ORPH":
+                    failures.append(
+                        f"reconcile: orphan issue_id recovery wrong, got "
+                        f"{entry['issue_id']}")
+            man_paths = {os.path.normpath(e["path"]) for e in manual}
+            if os.path.normpath(manual_path) not in man_paths:
+                failures.append(
+                    "reconcile: ref-by-no-log must be manual recovery")
+            # Extra path with NO log at all is also manual (AC-OW-004).
+            if os.path.normpath(
+                    os.path.join(wt_base, "wt-extra-no-log")) not in man_paths:
+                failures.append(
+                    "reconcile: path with no log must be manual recovery")
+
+            # Finalized parent log (parallel-queue, queue-exhausted) is NOT
+            # live -> its referenced path becomes orphan.
+            fin_par_path = os.path.join(wt_base, "wt-finpar")
+            _write_log("p-fin", kind="parallel-queue",
+                       worktree_path=fin_par_path, outcome="queue-exhausted",
+                       ended_at=time.time())
+            disk2 = disk + [fin_par_path]
+
+            def fake_list2(t, _disk=disk2):
+                return list(_disk)
+
+            globals()["_git_worktree_list"] = fake_list2
+            try:
+                orphans2, _manual2, _live2 = _classify_worktrees(rec_tmp)
+            finally:
+                globals()["_git_worktree_list"] = orig_list
+            fin_orph = {os.path.normpath(e["path"]) for e in orphans2}
+            if os.path.normpath(fin_par_path) not in fin_orph:
+                failures.append(
+                    "reconcile: finalized parallel-queue ref must be orphan")
+        finally:
+            shutil.rmtree(rec_tmp, ignore_errors=True)
     finally:
         sys.stdout.close()
         sys.stderr.close()
@@ -754,6 +1101,16 @@ def main(argv: Optional[list] = None) -> int:
     p = sub.add_parser("start", help="Dispatch one wave of ready approved issues")
     _add_target_arg(p)
     p.set_defaults(func=cmd_parallel_start)
+
+    p = sub.add_parser(
+        "reconcile-worktrees",
+        help="List and optionally sweep orphan worktrees (ISSUE-0013)")
+    _add_target_arg(p)
+    p.add_argument("--sweep", action="store_true",
+                   help="Remove orphan worktrees (never live or manual)")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip confirmation prompt when used with --sweep")
+    p.set_defaults(func=cmd_reconcile_worktrees)
 
     p = sub.add_parser("selftest", help="Internal sanity checks")
     p.set_defaults(func=lambda a: selftest())
