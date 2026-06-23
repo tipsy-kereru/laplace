@@ -40,6 +40,7 @@ wave outcomes.
 """
 
 import argparse
+import fnmatch
 import hashlib
 import os
 import sys
@@ -140,17 +141,29 @@ def _finalize_parent_log(run_id: str, outcome: str,
 
 def _append_wave(run_id: str, dispatched: List[str], in_flight: List[str],
                  halted: List[str], ready_count: int,
-                 target: Optional[str]) -> None:
+                 target: Optional[str],
+                 overlap_warning: Optional[List[Tuple[str, str, str]]] = None
+                 ) -> None:
     log = _load_parent_log(run_id, target)
     if log is None:
         return
-    log.setdefault("waves", []).append({
+    entry = {
         "ts": time.time(),
         "dispatched": [state._redact_evidence(i) for i in dispatched],
         "in_flight": [state._redact_evidence(i) for i in in_flight],
         "halted": [state._redact_evidence(i) for i in halted],
         "ready_count": ready_count,
-    })
+    }
+    # AC-FO-002: advisory overlap warning only emitted when non-empty, so the
+    # wave entry is byte-identical to the pre-feature shape when there is no
+    # overlap (parity for characterization tests on legacy waves).
+    if overlap_warning:
+        entry["overlap_warning"] = [
+            (state._redact_evidence(a), state._redact_evidence(b),
+             state._redact_evidence(g))
+            for (a, b, g) in overlap_warning
+        ]
+    log.setdefault("waves", []).append(entry)
     _save_parent_log(log, run_id, target)
 
 
@@ -307,6 +320,48 @@ def _compute_sets(approved: List[str], halted: List[str],
     return in_flight, ready
 
 
+def _compute_overlap_warnings(
+        to_dispatch: List[str],
+        target: Optional[str]) -> List[Tuple[str, str, str]]:
+    """Advisory file-overlap detection over the ready set (ISSUE-0012).
+
+    For each unordered pair (a, b) in ``to_dispatch`` and each pair of globs
+    (ga in touches(a), gb in touches(b)), if ``ga`` matches ``gb`` or vice
+    versa (fnmatch), record ``(a, b, ga)``. Self-pairs are excluded. Returns
+    ``[]`` when no issue carries ``touches`` or no glob overlaps.
+
+    Advisory only: the caller dispatches regardless of the result
+    (AC-FO-003).
+    """
+    if len(to_dispatch) < 2:
+        return []
+    tasks = state._load_tasks(target)
+    touches_by_issue: Dict[str, List[str]] = {}
+    for iid in to_dispatch:
+        rec = tasks.get(iid, {}) if isinstance(tasks, dict) else {}
+        globs = rec.get("touches") or []
+        if isinstance(globs, list) and globs:
+            touches_by_issue[iid] = [str(g) for g in globs]
+    if not touches_by_issue:
+        return []
+    warnings: List[Tuple[str, str, str]] = []
+    for i in range(len(to_dispatch)):
+        a = to_dispatch[i]
+        ga_list = touches_by_issue.get(a)
+        if not ga_list:
+            continue
+        for j in range(i + 1, len(to_dispatch)):
+            b = to_dispatch[j]
+            gb_list = touches_by_issue.get(b)
+            if not gb_list:
+                continue
+            for ga in ga_list:
+                for gb in gb_list:
+                    if fnmatch.fnmatch(ga, gb) or fnmatch.fnmatch(gb, ga):
+                        warnings.append((a, b, ga))
+    return warnings
+
+
 def _dispatch_wave(parent_run_id: str, target: Optional[str],
                    to_dispatch: List[str]) -> Tuple[List[str], List[str]]:
     """Call runner.cmd_start for each issue in to_dispatch.
@@ -366,6 +421,10 @@ def _run_parallel_wave(target: Optional[str],
     slots = max(0, max_parallel - len(in_flight))
     to_dispatch = ready[:slots]
 
+    # AC-FO-002: advisory file-overlap warning over the ready set. Computed
+    # before dispatch; dispatch proceeds regardless of the result.
+    overlap_warning = _compute_overlap_warnings(to_dispatch, target)
+
     halted_new, failed = _dispatch_wave(parent_run_id, target, to_dispatch)
 
     # start-failed halts the whole wave immediately.
@@ -375,7 +434,8 @@ def _run_parallel_wave(target: Optional[str],
         # Refresh in_flight/halted for the wave record before finalizing.
         in_flight_after, _ready_after = _compute_sets(approved, halted, target)
         _append_wave(parent_run_id, to_dispatch, in_flight_after,
-                     halted + halted_new, len(ready), target)
+                     halted + halted_new, len(ready), target,
+                     overlap_warning=overlap_warning)
         _finalize_parent_log(parent_run_id, outcome, target)
         print(f"parallel halted: {outcome}")
         return parent_run_id, EXIT_INVALID
@@ -390,7 +450,8 @@ def _run_parallel_wave(target: Optional[str],
         _save_parent_log(log, parent_run_id, target)
 
     _append_wave(parent_run_id, to_dispatch, in_flight_after,
-                 halted_after, len(ready), target)
+                 halted_after, len(ready), target,
+                 overlap_warning=overlap_warning)
 
     # Outcome decision.
     if not ready_after and not in_flight_after:

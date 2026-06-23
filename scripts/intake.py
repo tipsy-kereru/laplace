@@ -256,6 +256,34 @@ def _extract_depends_on(body: str) -> List[str]:
     return out
 
 
+def _extract_touches(body: str) -> List[str]:
+    """Parse a `Touches:` line into a list of glob patterns.
+
+    Mirrors `_extract_depends_on` but performs no ISSUE-NNNN validation:
+    `touches` carries arbitrary path globs (e.g. ``src/auth/**``). Matches
+    the first ``^Touches:\\s*(.+)$`` line (multiline, case-insensitive).
+    Splits the RHS on commas and/or whitespace. De-duplicates while
+    preserving order. Returns ``[]`` when absent or empty.
+    """
+    m = re.search(r"(?im)^Touches:\s*(.+)$", body)
+    if not m:
+        return []
+    raw = m.group(1).strip()
+    if not raw:
+        return []
+    tokens = re.split(r"[,\s]+", raw)
+    out: List[str] = []
+    seen = set()
+    for tok in tokens:
+        if not tok:
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
 def _extract_acceptance(body: str) -> List[str]:
     ac_head = re.compile(
         r"(?im)^\s*(?:#{1,6}\s*)?(?:Acceptance Criteria|AC|Acceptance)\s*:?\s*$"
@@ -324,6 +352,7 @@ def _render_issue(issue: Dict[str, Any]) -> str:
         "",
         "## Dependencies",
         f"- depends_on: {', '.join(issue['depends_on']) if issue['depends_on'] else '(none)'}",
+        f"- touches: {', '.join(issue['touches']) if issue['touches'] else '(none)'}",
         "",
         "## Scope",
         "**In Scope:**",
@@ -420,6 +449,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
             summary = r_title or "TBD"
             background = state._redact_evidence(_extract_background(body))
             deps = _extract_depends_on(body)
+            touches = [state._redact_evidence(g) for g in _extract_touches(body)]
             issue_type = _infer_type(title, body)
             area = state._redact_evidence(_infer_area(title))
             # Relative path keeps Source portable across machines.
@@ -439,6 +469,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
                 "scope": {"in_scope": in_scope, "out_scope": out_scope},
                 "acceptance_criteria": ac,
                 "depends_on": deps,
+                "touches": touches,
                 "technical_notes": "TBD",
                 "test_requirements": {
                     "unit": "TBD", "integration": "TBD", "e2e": "TBD",
@@ -473,6 +504,7 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
                 "created_at": time.time(),
                 "source": rel_doc,
                 "depends_on": deps,
+                "touches": touches,
             }
             if issue_id not in queue["draft"]:
                 queue["draft"].append(issue_id)
@@ -539,6 +571,7 @@ def selftest() -> int:
             "## Feature: User Login\n\n"
             "Users need to log in via OAuth. This is core to onboarding.\n\n"
             "Depends on: ISSUE-0001\n\n"
+            "Touches: src/auth/**, src/db/**\n\n"
             "In Scope:\n"
             "- Login page\n"
             "- Token refresh\n\n"
@@ -645,6 +678,20 @@ def selftest() -> int:
                 failures.append(f"{cid} should render empty depends_on as (none)")
             if tasks.get(cid, {}).get("depends_on") != []:
                 failures.append(f"{cid} tasks.json depends_on should be empty list")
+
+        # --- touches parsing ------------------------------------------------
+        if "touches: src/auth/**, src/db/**" not in c1:
+            failures.append("ISSUE-0001 touches not rendered in .md")
+        if tasks.get("ISSUE-0001", {}).get("touches") != ["src/auth/**", "src/db/**"]:
+            failures.append(f"ISSUE-0001 touches not in tasks.json: {tasks.get('ISSUE-0001')}")
+        # Other issues should render (none) and have empty lists.
+        for cid in ["ISSUE-0002", "ISSUE-0003"]:
+            if "touches: (none)" not in open(
+                os.path.join(issues_dir, f"{cid}.md"), "r", encoding="utf-8"
+            ).read():
+                failures.append(f"{cid} should render empty touches as (none)")
+            if tasks.get(cid, {}).get("touches") != []:
+                failures.append(f"{cid} tasks.json touches should be empty list")
 
         # --- Redaction of Source field -------------------------------------
         # The fake token must NOT appear in any persisted issue file.

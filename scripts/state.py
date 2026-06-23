@@ -878,6 +878,18 @@ def _format_status(target: Optional[str] = None) -> str:
         lines.append(f"  halted: {len(halted)}")
         if halted:
             lines.append(f"    {', '.join(halted)}")
+        # AC-FO-004: advisory file-overlap warning from the latest wave.
+        # Only emitted when the latest wave carries a non-empty
+        # ``overlap_warning``, so output is byte-identical when absent.
+        if waves:
+            latest = waves[-1]
+            ow = latest.get("overlap_warning") or []
+            if ow:
+                lines.append("  overlap warning:")
+                for entry in ow:
+                    if isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                        a, b, glob = entry[0], entry[1], entry[2]
+                        lines.append(f"    {a} <-> {b}: {glob}")
     # Active pipeline-run block (ISSUE-0005, AC-PL-009). Only emitted when
     # an active (non-finalized) pipeline log exists, so output is byte-
     # identical when no pipeline is active (AC-PL-009 characterization).
