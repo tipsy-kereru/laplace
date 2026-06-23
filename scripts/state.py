@@ -15,6 +15,7 @@ stdlib-only.
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -31,6 +32,10 @@ MAX_DIFF_LINES_WITHOUT_APPROVAL = 1000
 MAX_STOP_HOOK_ITERATIONS = 12
 MAX_QUEUE_RUN = 5
 MAX_PARALLEL = 2
+# ISSUE-0014: load-aware rate limiter. ratio = load1 / cpu_count; below
+# LOAD_THRESHOLD -> full cap; at/above LOAD_SEVERE -> defer the wave.
+LOAD_THRESHOLD = 0.7
+LOAD_SEVERE = 1.5
 
 DEFAULT_MERGE_POLICY = "wait-for-human-merge"
 VALID_MERGE_POLICIES = {"wait-for-human-merge", "auto-merge-branch"}
@@ -362,6 +367,8 @@ limits:
   max_stop_hook_iterations: %d
   max_queue_run: %d
   max_parallel: %d
+  load_threshold: %s
+  load_severe: %s
 policy:
   require_approval_for:
     - git_push
@@ -387,6 +394,8 @@ redaction:
     MAX_STOP_HOOK_ITERATIONS,
     MAX_QUEUE_RUN,
     MAX_PARALLEL,
+    LOAD_THRESHOLD,
+    LOAD_SEVERE,
     DEFAULT_MERGE_POLICY,
 )
 
@@ -620,6 +629,27 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
                   file=sys.stderr)
             sys.exit(2)
 
+    # load_threshold / load_severe: positive floats (ISSUE-0014).
+    def _parse_positive_float(raw_value, name, default):
+        if raw_value is None or raw_value == "":
+            return default
+        try:
+            v = float(raw_value)
+        except ValueError:
+            print(f"invalid {name} (not a float): {raw_value!r}",
+                  file=sys.stderr)
+            sys.exit(2)
+        if not (v > 0.0):
+            print(f"invalid {name} (must be positive float): {v}",
+                  file=sys.stderr)
+            sys.exit(2)
+        return v
+
+    load_threshold = _parse_positive_float(
+        limits.get("load_threshold"), "load_threshold", LOAD_THRESHOLD)
+    load_severe = _parse_positive_float(
+        limits.get("load_severe"), "load_severe", LOAD_SEVERE)
+
     # merge_policy: enum, default wait-for-human-merge.
     merge_policy = policy.get("merge_policy") or DEFAULT_MERGE_POLICY
     if merge_policy not in VALID_MERGE_POLICIES:
@@ -636,6 +666,8 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
     return {
         "max_queue_run": max_queue_run,
         "max_parallel": max_parallel,
+        "load_threshold": load_threshold,
+        "load_severe": load_severe,
         "merge_policy": merge_policy,
         "auto_merge_main_at_exhaustion": auto_merge_main,
     }
@@ -733,9 +765,13 @@ def _find_active_parallel_run(target: Optional[str] = None) \
         if outcome is not None and outcome not in (
                 "wave-dispatched", "wave-dispatched:waiting") \
                 and not (isinstance(outcome, str)
-                         and outcome.startswith("cancel-failed")):
+                         and outcome.startswith("cancel-failed")) \
+                and not (isinstance(outcome, str)
+                         and outcome.startswith("wave-deferred:high-load")):
             # cancel-failed:* keeps the run ACTIVE so /laplace:status
             # surfaces stranded children (security finding 1/3).
+            # wave-deferred:high-load:* keeps the run ACTIVE so the model
+            # can resume after system load drops (ISSUE-0014, AC-RL-004).
             continue
         candidates.append(log)
     if not candidates:
@@ -779,6 +815,36 @@ def _find_active_pipeline_run(target: Optional[str] = None) \
         key=lambda l: float(l.get("started_at") or 0.0),
         reverse=True)
     return candidates[0]
+
+
+def _parallel_load_summary(target: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Sample the current system load and compute the effective dispatch cap
+    for /laplace:status (ISSUE-0014, AC-RL-006).
+
+    Returns ``None`` when ``os.getloadavg`` is unavailable (Windows) so the
+    caller omits the Load line entirely. Otherwise returns a dict with
+    ``ratio`` (load1/cpu, formatted to 2 decimals), ``cap`` (effective cap),
+    and ``max_parallel`` from config.
+    """
+    if not hasattr(os, "getloadavg"):
+        return None
+    try:
+        cfg = load_config(target)
+    except SystemExit:
+        return None
+    cpu = os.cpu_count() or 1
+    load1 = os.getloadavg()[0]
+    ratio = load1 / cpu
+    max_parallel = cfg.get("max_parallel", MAX_PARALLEL)
+    load_threshold = cfg.get("load_threshold", LOAD_THRESHOLD)
+    load_severe = cfg.get("load_severe", LOAD_SEVERE)
+    if ratio < load_threshold:
+        cap = max_parallel
+    elif ratio < load_severe:
+        cap = max(1, max_parallel - math.ceil((ratio - load_threshold) * max_parallel))
+    else:
+        cap = 0
+    return {"ratio": f"{ratio:.2f}", "cap": cap, "max_parallel": max_parallel}
 
 
 def _parallel_in_flight_pairs(log: Dict[str, Any],
@@ -890,6 +956,15 @@ def _format_status(target: Optional[str] = None) -> str:
                     if isinstance(entry, (list, tuple)) and len(entry) >= 3:
                         a, b, glob = entry[0], entry[1], entry[2]
                         lines.append(f"    {a} <-> {b}: {glob}")
+        # ISSUE-0014 / AC-RL-006: current load ratio + effective cap. Only
+        # emitted when os.getloadavg is available so Windows output stays
+        # byte-identical to the pre-feature shape (AC-RL-005).
+        load_info = _parallel_load_summary(target)
+        if load_info is not None:
+            lines.append(
+                f"  Load: ratio={load_info['ratio']} "
+                f"(cap {load_info['cap']} of max_parallel "
+                f"{load_info['max_parallel']})")
     # Active pipeline-run block (ISSUE-0005, AC-PL-009). Only emitted when
     # an active (non-finalized) pipeline log exists, so output is byte-
     # identical when no pipeline is active (AC-PL-009 characterization).
