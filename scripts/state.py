@@ -80,9 +80,14 @@ VALID_TRANSITIONS: Dict[str, List[str]] = {
     "in-progress": ["review", "blocked", "needs-fix", "human-approval-required"],
     "review": ["needs-fix", "review-passed", "security-review", "blocked",
                "human-approval-required"],
-    "security-review": ["needs-fix", "review-passed", "blocked",
+    "security-review": ["needs-fix", "review-passed", "cost-review", "blocked",
                         "human-approval-required"],
     "needs-fix": ["in-progress", "blocked", "human-approval-required"],
+    # SPEC-006: cost-review sits between security-review and review-passed.
+    # Entered only when config cost_watcher.enabled is true; otherwise the
+    # runner routes security-review -> review-passed directly. cost-review
+    # never bypasses review-passed, so AC-LP-008 still fires on release.
+    "cost-review": ["review-passed", "human-approval-required", "blocked"],
     "review-passed": ["release-candidate", "blocked"],
     "release-candidate": ["done", "blocked"],
     "done": [],
@@ -303,6 +308,73 @@ def _dependencies_satisfied(issue_id: str,
     return True, "ok"
 
 
+# SPEC-004: terminal states that should propagate a block to dependents.
+# Success terminals (review-passed, security-passed, release-candidate, done)
+# satisfy the dependency. Failure terminals (blocked, cancelled,
+# max-attempts-exceeded) and the stalled terminal (human-approval-required)
+# propagate: a dependent should not build on a failed or parked upstream.
+# NOTE: _dependencies_satisfied above treats ALL terminal states as
+# satisfied, which is why explicit propagation is required -- without it,
+# a dependent of a blocked upstream would be dispatched.
+PROPAGATING_TERMINALS = (
+    "blocked",
+    "cancelled",
+    "max-attempts-exceeded",
+    "human-approval-required",
+)
+
+
+def propagate_upstream_blocks(target: Optional[str] = None) -> List[Tuple[str, str, str]]:
+    """SPEC-004: mark non-terminal dependents of failed/parked upstreams.
+
+    Scans tasks for issues in a PROPAGATING_TERMINALS state. For each, finds
+    dependents (issues X where the upstream id is in X.depends_on) that are
+    NOT themselves terminal, and sets them to ``blocked`` with reason
+    ``upstream:<upstream_id>:<upstream_state>``. Transitive: a dependent
+    that becomes blocked will itself propagate on the next scan pass within
+    the same call (loop until no new blocks).
+
+    Returns a list of (dependent_id, upstream_id, upstream_state) tuples for
+    every propagation applied, for audit logging. Idempotent: re-running on
+    an already-propagated state produces no new blocks.
+    """
+    applied: List[Tuple[str, str, str]] = []
+    # Iterate to a fixpoint so transitive chains (A <- B <- C) settle in one
+    # call: blocking A blocks B, which then blocks C.
+    while True:
+        tasks = _load_tasks(target)
+        # Build reverse index: upstream -> list of dependent ids.
+        dependents: Dict[str, List[str]] = {}
+        for dep_id, rec in tasks.items():
+            for up in (rec.get("depends_on") or []):
+                dependents.setdefault(up, []).append(dep_id)
+        newly_blocked: List[Tuple[str, str, str]] = []
+        for up_id, rec in tasks.items():
+            up_state = rec.get("status")
+            if up_state not in PROPAGATING_TERMINALS:
+                continue
+            for dep_id in dependents.get(up_id, []):
+                dep_rec = tasks.get(dep_id, {})
+                dep_state = dep_rec.get("status")
+                if dep_state in TERMINAL_STATES:
+                    continue
+                # Idempotency: skip if already blocked with a matching
+                # upstream reason for THIS upstream.
+                if dep_state == "blocked" and dep_rec.get("block_reason", "").startswith(
+                        f"upstream:{up_id}:"):
+                    continue
+                newly_blocked.append((dep_id, up_id, up_state))
+        if not newly_blocked:
+            break
+        for dep_id, up_id, up_state in newly_blocked:
+            _set_issue_state(
+                dep_id, "blocked", target=target,
+                block_reason=f"upstream:{up_id}:{up_state}",
+            )
+            applied.append((dep_id, up_id, up_state))
+    return applied
+
+
 # --- Tasks / queue helpers ------------------------------------------------------
 
 def _tasks_path(target: Optional[str] = None) -> str:
@@ -387,6 +459,33 @@ policy:
     - workflow_script_release_change
   merge_policy: %s
   auto_merge_main_at_exhaustion: false
+cost_watcher:
+  enabled: false
+  thresholds:
+    tokens:
+      warn: 500000
+      block: 2000000
+    runtime_minutes:
+      warn: 30
+      block: 55
+    files_changed:
+      warn: 10
+      block: 18
+motivations:
+  enabled: false
+  max_dispatches_per_hour: 10
+  triggers:
+    clock:
+      enabled: true
+      due_within_hours: 24
+    git-upstream:
+      enabled: true
+      base_branch: main
+    idle-queue:
+      enabled: true
+      idle_threshold_hours: 2
+    test-signal:
+      enabled: false
 redaction:
   enabled: true
   store_raw_command_output: false
@@ -420,6 +519,21 @@ routes:
   - match: { type: security }
     agent: security
     next_phase: security-review
+
+# SPEC-003: per-type evidence requirements on state exits. To advance out
+# of a listed from_state, the run log must contain each listed evidence
+# kind (captured via `runner.py evidence <run> <kind> <path-or-text>`).
+# Types not listed here fall back to built-in defaults (bug: reproduction
+# at pm-review; ui: visual at review). An empty list means "intentionally
+# none" and overrides the default.
+evidence_requirements:
+  feature: {}
+  bug:
+    pm-review: [reproduction]
+  ui:
+    review: [visual]
+  chore: {}
+  security: {}
 """
 
 AGENT_POLICY_TEMPLATE = """\
@@ -669,6 +783,8 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
         policy.get("auto_merge_main_at_exhaustion"),
         DEFAULT_AUTO_MERGE_MAIN_AT_EXHAUSTION)
 
+    cost_watcher = _parse_cost_watcher(text)
+
     return {
         "max_queue_run": max_queue_run,
         "max_parallel": max_parallel,
@@ -676,7 +792,117 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
         "load_severe": load_severe,
         "merge_policy": merge_policy,
         "auto_merge_main_at_exhaustion": auto_merge_main,
+        "cost_watcher": cost_watcher,
     }
+
+
+# --- SPEC-006: cost watcher config --------------------------------------------
+
+DEFAULT_COST_WATCHER_ENABLED = False
+DEFAULT_COST_THRESHOLDS = {
+    "tokens": {"warn": 500000, "block": 2000000},
+    "runtime_minutes": {"warn": 30, "block": 55},
+    "files_changed": {"warn": 10, "block": 18},
+}
+
+# Hard-cap limits that cost-watcher block thresholds MUST sit below. A signal
+# absent from this map has no hard cap (tokens today); its block threshold is
+# unchecked. Synchronized with the limits block in CONFIG_YML_TEMPLATE.
+COST_WATCHER_HARD_CAPS = {
+    "runtime_minutes": MAX_RUNTIME_MINUTES_PER_ISSUE,
+    "files_changed": MAX_FILES_CHANGED_WITHOUT_APPROVAL,
+}
+
+
+def _parse_cost_watcher(text: str) -> Dict[str, Any]:
+    """Parse the optional ``cost_watcher:`` block from config.yml.
+
+    Returns {"enabled": bool, "thresholds": {signal: {warn, block}}}.
+    Missing block -> defaults (DEFAULT_COST_WATCHER_ENABLED False + defaults).
+
+    Validator: when enabled, every signal that has a hard cap must satisfy
+    block < hard_cap. Exits with code 2 otherwise (B10).
+    """
+    enabled = DEFAULT_COST_WATCHER_ENABLED
+    thresholds = {
+        sig: {"warn": v["warn"], "block": v["block"]}
+        for sig, v in DEFAULT_COST_THRESHOLDS.items()
+    }
+
+    # Find the cost_watcher block (top-level key at column 0).
+    lines = text.splitlines()
+    in_block = False
+    in_thresholds = False
+    block_indent: Optional[int] = None
+    cur_signal: Optional[str] = None
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        stripped = raw.strip()
+        if indent == 0:
+            in_block = stripped == "cost_watcher:"
+            block_indent = None
+            in_thresholds = False
+            cur_signal = None
+            continue
+        if not in_block:
+            continue
+        if block_indent is None:
+            block_indent = indent
+        # Direct children of cost_watcher (indent == block_indent).
+        if indent == block_indent:
+            in_thresholds = False
+            cur_signal = None
+            if ":" not in stripped:
+                continue
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            value = value.strip()
+            if key == "enabled":
+                enabled = (value.lower() in ("true", "yes", "1"))
+            elif key == "thresholds":
+                in_thresholds = True
+            continue
+        if not in_thresholds:
+            continue
+        # Under thresholds: signal rows at block_indent+2, warn/block at +4.
+        if indent == block_indent + 2:
+            cur_signal = stripped.split(":", 1)[0].strip() or None
+            if cur_signal and cur_signal not in thresholds:
+                cur_signal = None
+            continue
+        if cur_signal and indent == block_indent + 4:
+            if ":" not in stripped:
+                continue
+            key, _, value = stripped.partition(":")
+            key = key.strip()
+            if key in ("warn", "block"):
+                try:
+                    thresholds[cur_signal][key] = int(value.strip())
+                except ValueError:
+                    print(f"invalid cost_watcher threshold {cur_signal}.{key}: "
+                          f"{value!r}", file=sys.stderr)
+                    sys.exit(2)
+
+    # Validator (B10): block must be < hard_cap for each capped signal.
+    for sig, cap in COST_WATCHER_HARD_CAPS.items():
+        block = thresholds[sig]["block"]
+        if block >= cap:
+            print(
+                f"cost_watcher.thresholds.{sig}.block ({block}) must be < "
+                f"hard cap limits.{_HARD_CAP_KEY[sig]} ({cap})",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    return {"enabled": enabled, "thresholds": thresholds}
+
+
+_HARD_CAP_KEY = {
+    "runtime_minutes": "max_runtime_minutes_per_issue",
+    "files_changed": "max_files_changed_without_approval",
+}
 
 
 def _find_resumable_queue_run(target: Optional[str] = None) \
@@ -1140,7 +1366,8 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def _set_issue_state(issue_id: str, new_state: str, target: Optional[str] = None,
-                     run_id: Optional[str] = None, attempt: Optional[int] = None) -> None:
+                     run_id: Optional[str] = None, attempt: Optional[int] = None,
+                     block_reason: Optional[str] = None) -> None:
     tasks = _load_tasks(target)
     t = tasks.get(issue_id, {})
     t["status"] = new_state
@@ -1149,6 +1376,12 @@ def _set_issue_state(issue_id: str, new_state: str, target: Optional[str] = None
         t["run_id"] = run_id
     if attempt is not None:
         t["attempts"] = attempt
+    # SPEC-004: block_reason is set when transitioning to blocked via upstream
+    # propagation. Cleared on any transition away from blocked.
+    if block_reason is not None:
+        t["block_reason"] = block_reason
+    elif new_state != "blocked":
+        t.pop("block_reason", None)
     tasks[issue_id] = t
     _save_tasks(tasks, target=target)
     # Update queue: insert into the matching queue state if it's a queue-tracked state.

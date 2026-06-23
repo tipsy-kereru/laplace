@@ -41,8 +41,20 @@ MAX_FIX_ATTEMPTS = state.MAX_FIX_ATTEMPTS
 MAX_SECURITY_FIX_ATTEMPTS = state.MAX_SECURITY_FIX_ATTEMPTS
 
 BRANCH_PREFIX = "laplace"
-ALLOWED_EVIDENCE_KINDS = ("test", "review", "security", "manual", "command")
+ALLOWED_EVIDENCE_KINDS = ("test", "review", "security", "manual", "command",
+                          "reproduction", "visual")
 EVIDENCE_SUMMARY_MAX = 1000
+
+# SPEC-003: per-type evidence requirements on state exits. Keys are issue
+# routing types; values map {from_state: [evidence_kind, ...]}. The runner
+# refuses to advance out of `from_state` until each listed kind appears in
+# the run log. Defaults mirror routing-rules.yml `evidence_requirements:`.
+# Users override via routing-rules.yml; this dict is the fallback when the
+# file omits a type or the block is absent.
+DEFAULT_EVIDENCE_REQUIREMENTS = {
+    "bug": {"pm-review": ["reproduction"]},
+    "ui": {"review": ["visual"]},
+}
 
 # Exit code for fix-attempt limit exceeded (AC-LP-010). Orchestrator routes
 # the issue to `blocked` or `human-approval-required` on this signal.
@@ -512,8 +524,142 @@ def _run_has_test_evidence(run_id: str, target: Optional[str]) -> bool:
     return any(e.get("kind") == "test" for e in run.get("evidence", []))
 
 
+def _run_has_evidence_kind(run_id: str, kind: str,
+                           target: Optional[str]) -> bool:
+    """True iff the run log has at least one evidence entry with kind==`kind`.
+
+    Generalization of `_run_has_test_evidence` for SPEC-003 per-type gates.
+    """
+    run = state._read_json(_run_log_path(run_id, target), default=None)
+    if not isinstance(run, dict):
+        return False
+    return any(e.get("kind") == kind for e in run.get("evidence", []))
+
+
 # States that require prior test evidence in the run log (AC-LP-008).
 TEST_EVIDENCE_REQUIRED_TARGETS = ("review-passed",)
+
+
+def _load_evidence_requirements(target: Optional[str]) -> Dict[str, Dict[str, List[str]]]:
+    """Parse `evidence_requirements:` block from routing-rules.yml.
+
+    Returns {type: {from_state: [kind, ...]}}. Missing types inherit nothing.
+    stdlib-only line parser; tolerates the block being absent (returns {}).
+    On any parse error returns {} and lets DEFAULT_EVIDENCE_REQUIREMENTS
+    apply via `_evidence_required_for`.
+    """
+    path = os.path.join(state._harness_root(target), ".harness",
+                        "routing-rules.yml")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return {}
+
+    out: Dict[str, Dict[str, List[str]]] = {}
+    in_block = False
+    block_indent: Optional[int] = None
+    cur_type: Optional[str] = None
+    cur_type_indent: Optional[int] = None
+    for raw in lines:
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        stripped = raw.strip()
+        if indent == 0:
+            in_block = stripped == "evidence_requirements:"
+            block_indent = None
+            cur_type = None
+            cur_type_indent = None
+            continue
+        if not in_block:
+            continue
+        if block_indent is None:
+            block_indent = indent
+        # Type row: "<type>:" at block indent, optionally "<type>: {}" empty.
+        if indent == block_indent:
+            base = stripped
+            if base.endswith("{}"):
+                base = base[:-2].rstrip()
+            if base.endswith(":"):
+                cur_type = base[:-1].strip()
+                if cur_type:
+                    out.setdefault(cur_type, {})
+                cur_type_indent = None
+                continue
+            cur_type = None
+            continue
+        # Nested under a type.
+        if cur_type is None:
+            continue
+        if cur_type_indent is None:
+            cur_type_indent = indent
+        if indent != cur_type_indent:
+            continue
+        # "from_state: [k1, k2]" or "from_state: []"
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        from_state = key.strip()
+        raw_list = value.strip()
+        kinds: List[str] = []
+        if raw_list.startswith("[") and raw_list.endswith("]"):
+            inner = raw_list[1:-1]
+            for tok in inner.split(","):
+                tok = tok.strip().strip('"').strip("'").strip()
+                if tok:
+                    kinds.append(tok)
+        if from_state:
+            out[cur_type][from_state] = kinds
+    return out
+
+
+def _evidence_required_for(rtype: str, from_state: str,
+                           target: Optional[str]) -> List[str]:
+    """Resolve the evidence kinds required to exit `from_state` for `rtype`.
+
+    Precedence: routing-rules.yml `evidence_requirements:` > built-in
+    DEFAULT_EVIDENCE_REQUIREMENTS. Unknown type or state -> no requirement.
+    """
+    if not rtype:
+        return []
+    file_map = _load_evidence_requirements(target)
+    # File takes precedence if it declares the type at all; otherwise fall
+    # back to built-in defaults. A type declared as `{}` in the file means
+    # "intentionally no requirements" and overrides the default.
+    if rtype in file_map:
+        return list(file_map[rtype].get(from_state, []))
+    builtin = DEFAULT_EVIDENCE_REQUIREMENTS.get(rtype, {})
+    return list(builtin.get(from_state, []))
+
+
+def _issue_routing_type(issue_id: str, target: Optional[str]) -> str:
+    """Best-effort routing.type lookup for an issue, from its .md file.
+
+    Returns '' on any failure (missing file, missing section, parse error).
+    Reuses `_parse_issue_for_security` which already extracts routing.type.
+    """
+    path = os.path.join(state._issues_dir(target), f"{issue_id}.md")
+    if not os.path.exists(path):
+        return ""
+    try:
+        meta = _parse_issue_for_security(path)
+    except Exception:
+        return ""
+    routing = meta.get("routing") or {}
+    return str(routing.get("type", "")).strip().lower()
+
+
+def _required_evidence_for_advance(issue_id: str, from_state: str,
+                                   target: Optional[str]) -> List[str]:
+    """SPEC-003 gate resolver: evidence kinds required to advance out of
+    `from_state` for this issue's routing type."""
+    rtype = _issue_routing_type(issue_id, target)
+    return _evidence_required_for(rtype, from_state, target)
+
+
 
 
 def cmd_advance(args: argparse.Namespace) -> int:
@@ -573,6 +719,22 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # survives the state change.
         state._save_tasks(tasks, target=args.target)
 
+    # SPEC-006: cost watcher. Two integration points:
+    # 1. security-review -> review-passed when cost_watcher.enabled: redirect
+    #    to cost-review first (transparent to callers). Done here, BEFORE the
+    #    AC-LP-008 test-evidence gate, so the redirect is not blocked by the
+    #    review-passed evidence check (which applies on the later
+    #    cost-review -> review-passed hop).
+    # 2. cost-review -> review-passed: invoke cost_review.decide. On block,
+    #    cost_review moves the issue to human-approval-required and returns 4.
+    if args.from_state == "security-review" and args.to_state == "review-passed":
+        cfg = state.load_config(args.target)
+        if (cfg.get("cost_watcher") or {}).get("enabled"):
+            state._set_issue_state(issue_id, "cost-review", target=args.target)
+            print(f"advance: cost_watcher enabled -> routed to cost-review "
+                  f"(from security-review) for {issue_id}", file=sys.stderr)
+            return 0
+
     # AC-LP-008: review-passed requires at least one test-evidence entry in
     # the run log. Enforced here so the gate cannot be bypassed by the skill
     # or agent; the model cannot self-declare review-passed without evidence.
@@ -586,6 +748,38 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 4
+
+    # SPEC-003: per-type evidence requirements on the FROM state. The issue's
+    # routing type (parsed from its .md file) selects a {from_state: [kind]}
+    # map; each listed kind must appear in the run log before the transition
+    # proceeds. Missing type or empty map -> no extra requirement (regression
+    # guard: feature path unchanged).
+    required_kinds = _required_evidence_for_advance(issue_id, args.from_state,
+                                                    args.target)
+    if required_kinds:
+        run_id = meta.get("run_id")
+        missing = [k for k in required_kinds
+                   if not run_id or not _run_has_evidence_kind(run_id, k, args.target)]
+        if missing:
+            print(
+                f"advance failed: type={_issue_routing_type(issue_id, args.target) or '?'} "
+                f"requires evidence kinds {required_kinds} at {args.from_state} exit; "
+                f"missing {missing} (run_id={run_id}); capture via "
+                f"`runner.py evidence <run> <kind> <path-or-text>`",
+                file=sys.stderr,
+            )
+            return 4
+
+    # SPEC-006 (cont.): cost-review -> review-passed invokes the cost watcher
+    # decision. On block, cost_review moves the issue to
+    # human-approval-required and returns 4. On pass/warn, fall through so
+    # AC-LP-008 (already checked above) and the normal set-state run.
+    if args.from_state == "cost-review" and args.to_state == "review-passed":
+        import cost_review  # local import; same-scripts dir
+        rc = cost_review.cmd_review(argparse.Namespace(
+            issue_id=issue_id, target=args.target))
+        if rc != 0:
+            return rc
 
     state._set_issue_state(issue_id, args.to_state, target=args.target)
 

@@ -36,6 +36,17 @@ The goal is not autonomy. It is **traceable, reviewable, stoppable** engineering
 
 Draft. MVP scope: P0–P6. See `specs/SPEC-002-laplace-claude-code-plugin.md` for the full specification.
 
+## What's new in 0.6.0
+
+Four opt-in features, all off by default — upgrading changes no existing loop:
+
+- **Type-aware evidence gates** (SPEC-003) — `bug` issues must show a failing reproduction test before dev; `ui` issues must show a visual artifact before security review. Data-driven via `routing-rules.yml`.
+- **Upstream blocker propagation** (SPEC-004) — when an issue blocks, its dependents block too (transitively), instead of dispatching into a half-built tree.
+- **Cost watcher gate** (SPEC-006) — optional `cost-review` phase before release-candidate; halts on runtime / files-changed / token budget breach.
+- **Motivation triggers** (SPEC-005) — `motivations.py --once` one-shot scheduler for cron/launchd: resumes approved issues on clock, git-upstream, idle, or test-failure signals.
+
+See `CHANGELOG.md` and `specs/SPEC-003..006-*.md`.
+
 ---
 
 ## Requirements
@@ -154,7 +165,9 @@ flowchart LR
     PM --> Dev["Dev<br/>(impl)"]
     Dev --> Review["Review<br/>(gate)"]
     Review --> Security["Security<br/>(gate)"]
+    Security -.->|opt: cost_watcher| Cost["Cost<br/>(budget gate)"]
     Security --> RC[/"RC<br/>(release-candidate)"/]
+    Cost --> RC
 
     PM -.->|ambiguous scope| blocked[/blocked/]
     Review -.->|findings| needsfix[/needs-fix/]

@@ -81,6 +81,7 @@ IN_FLIGHT_STATUSES = (
     "review",
     "needs-fix",
     "security-review",
+    "cost-review",  # SPEC-006: counts toward max_parallel when cost watcher runs
 )
 
 # Outcomes that leave the parent log open (waiting for re-invocation).
@@ -212,6 +213,7 @@ def _append_wave(run_id: str, dispatched: List[str], in_flight: List[str],
                  target: Optional[str],
                  overlap_warning: Optional[List[Tuple[str, str, str]]] = None,
                  load_cap: Optional[int] = None,
+                 note: Optional[str] = None,
                  ) -> None:
     log = _load_parent_log(run_id, target)
     if log is None:
@@ -223,6 +225,8 @@ def _append_wave(run_id: str, dispatched: List[str], in_flight: List[str],
         "halted": [state._redact_evidence(i) for i in halted],
         "ready_count": ready_count,
     }
+    if note:
+        entry["note"] = note
     # AC-FO-002: advisory overlap warning only emitted when non-empty, so the
     # wave entry is byte-identical to the pre-feature shape when there is no
     # overlap (parity for characterization tests on legacy waves).
@@ -490,6 +494,20 @@ def _run_parallel_wave(target: Optional[str],
         _save_parent_log(parent, parent_run_id, target)
 
     approved = list(state._load_queue(target).get("approved", []))
+
+    # SPEC-004: propagate upstream blocks before computing sets. Dependents
+    # of failure/stalled-terminal upstreams are marked blocked here so the
+    # ready computation below excludes them (a blocked issue is no longer in
+    # the approved queue and not in_flight). Idempotent.
+    propagated = state.propagate_upstream_blocks(target)
+    if propagated:
+        # Refresh approved -- a dependent that was approved may now be blocked
+        # and removed from the approved queue by _set_issue_state.
+        approved = list(state._load_queue(target).get("approved", []))
+        for dep_id, up_id, up_state in propagated:
+            _append_wave(parent_run_id, [], [], [], 0, target,
+                         note=f"block-propagated: {dep_id} via {up_id} "
+                              f"({up_state})")
 
     in_flight, ready = _compute_sets(approved, halted, target)
 
