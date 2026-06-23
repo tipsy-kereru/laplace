@@ -34,6 +34,24 @@ MAX_PARALLEL = 2
 
 DEFAULT_MERGE_POLICY = "wait-for-human-merge"
 VALID_MERGE_POLICIES = {"wait-for-human-merge", "auto-merge-branch"}
+# ISSUE-0011: integration -> main auto-merge at queue-exhaustion. Default
+# off so a disabled config is byte-identical to pre-ISSUE-0011 behavior.
+DEFAULT_AUTO_MERGE_MAIN_AT_EXHAUSTION = False
+
+
+def _parse_bool(raw: str, default: bool = False) -> bool:
+    """Parse a config bool. Accepts true/false/yes/no/1/0 (case-insensitive).
+
+    On unrecognized or empty input, returns ``default`` (fail-safe).
+    """
+    if raw is None or raw == "":
+        return default
+    v = raw.strip().lower()
+    if v in ("true", "yes", "1", "on"):
+        return True
+    if v in ("false", "no", "0", "off"):
+        return False
+    return default
 
 LOCK_TTL_SECONDS = 60 * 60  # stale-lock detection window (60 min default)
 
@@ -355,6 +373,7 @@ policy:
     - data_access_change
     - workflow_script_release_change
   merge_policy: %s
+  auto_merge_main_at_exhaustion: false
 redaction:
   enabled: true
   store_raw_command_output: false
@@ -608,10 +627,17 @@ def load_config(target: Optional[str] = None) -> Dict[str, Any]:
               f"(valid: {sorted(VALID_MERGE_POLICIES)})", file=sys.stderr)
         sys.exit(2)
 
+    # auto_merge_main_at_exhaustion: bool, default False (ISSUE-0011).
+    # Parsed from the ``policy:`` block so it sits next to merge_policy.
+    auto_merge_main = _parse_bool(
+        policy.get("auto_merge_main_at_exhaustion"),
+        DEFAULT_AUTO_MERGE_MAIN_AT_EXHAUSTION)
+
     return {
         "max_queue_run": max_queue_run,
         "max_parallel": max_parallel,
         "merge_policy": merge_policy,
+        "auto_merge_main_at_exhaustion": auto_merge_main,
     }
 
 
@@ -1318,7 +1344,7 @@ def selftest() -> int:
                       "max_security_fix_attempts", "max_runtime_minutes_per_issue",
                       "max_files_changed_without_approval", "max_diff_lines_without_approval",
                       "max_stop_hook_iterations", "max_queue_run", "max_parallel",
-                      "merge_policy"]:
+                      "merge_policy", "auto_merge_main_at_exhaustion"]:
             if limit not in cfg_text:
                 failures.append(f"config.yml missing {limit}")
 

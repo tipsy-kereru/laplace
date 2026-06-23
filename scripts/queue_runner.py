@@ -315,8 +315,157 @@ def _auto_merge_issue(issue_id: str, queue_run_id: str,
 
 
 # ---------------------------------------------------------------------------
-# Parent queue run log (AC-QR-009)
+# Integration -> main auto-merge at queue-exhaustion (ISSUE-0011)
 # ---------------------------------------------------------------------------
+
+# Reason tokens for the queue-exhaustion main-merge hop. The caller maps
+# these to parent-log outcomes:
+#   ok    -> "main-merged:<sha>"
+#   halt  -> "main-merge-conflict:<queue_run_id>"
+#   skip  -> caller keeps its original "queue-exhausted" outcome
+_AMM_REASON_DISABLED = "disabled"           # flag off or wrong merge_policy
+_AMM_REASON_NOT_REPO = "not-a-git-repo"     # non-repo target
+_AMM_REASON_TESTS_FAILED = "tests-failed"   # pytest returned non-zero
+_AMM_REASON_CONFLICT = "main-merge-conflict"
+
+
+def _auto_merge_integration_to_main(queue_run_id: str,
+                                    target: Optional[str]) \
+        -> Tuple[str, str]:
+    """Attempt the optional integration -> main merge at queue-exhaustion.
+
+    ISSUE-0011: when the queue is exhausted and
+    ``auto_merge_main_at_exhaustion`` is enabled under the
+    ``auto-merge-branch`` policy, run the test gate and merge the
+    integration branch ``laplace/queue-<queue_run_id>`` into the base
+    branch (``main`` with ``master`` fallback -- NEVER config-derived).
+
+    Sequence (every git op routed through ``policy.check_command`` first):
+      1. Non-repo (no .git)            -> (skip, "not-a-git-repo").
+      2. Config gate off               -> (skip, "disabled").
+      3. ``pytest -q`` non-zero        -> (skip, "tests-failed").
+      4. Resolve base (main, else master).
+      5. ``git checkout <base>``.
+      6. ``git merge --no-ff laplace/queue-<queue_run_id>``.
+         Exit 0 -> sha = ``git rev-parse <base>``,
+                   (ok, "main-merged:<sha>").
+         Non-zero -> ``git merge --abort``, (halt,
+                     "main-merge-conflict:<queue_run_id>").
+
+    PROTECTED-REF GUARD: the merge target is hardcoded main/master. It is
+    NEVER derived from config or user input (structural, same pattern as the
+    auto-merge-branch protected-ref guard in ``_auto_merge_issue``).
+
+    No push, no force.
+    """
+    root = state._harness_root(target)
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return ("skip", _AMM_REASON_NOT_REPO)
+
+    config = state.load_config(target)
+    if not config.get("auto_merge_main_at_exhaustion") \
+            or config.get("merge_policy") != "auto-merge-branch":
+        return ("skip", _AMM_REASON_DISABLED)
+
+    # Test gate. Run pytest at the harness root; non-zero -> skip the
+    # main-merge entirely (integration branch preserved for the human).
+    # pytest is not a git op, so policy.check_command does not apply here.
+    try:
+        test_proc = subprocess.run(
+            ["python3", "-m", "pytest", "-q"],
+            cwd=root, capture_output=True, timeout=300)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        # pytest missing / infra failure -> fail safe: skip main-merge.
+        return ("skip", _AMM_REASON_TESTS_FAILED)
+    if test_proc.returncode != 0:
+        return ("skip", _AMM_REASON_TESTS_FAILED)
+
+    def _checked(op_argv: List[str], op_label: str) \
+            -> Optional[subprocess.CompletedProcess]:
+        """Route an op through policy.check_command; return None if denied."""
+        cmd_str = "git " + " ".join(op_argv)
+        ok, _reason = policy.check_command(cmd_str)
+        if not ok:
+            return None
+        try:
+            return subprocess.run(
+                ["git", "-C", root] + op_argv,
+                capture_output=True, timeout=30)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+
+    # Resolve base branch. Hardcoded main -> master; never config-derived.
+    base = None
+    for cand in ("main", "master"):
+        r = _checked(["rev-parse", "--verify", cand], "rev-parse base")
+        if r is None:
+            return ("skip", _AMM_REASON_DISABLED)
+        if r.returncode == 0:
+            base = cand
+            break
+    if base is None:
+        # Neither main nor master exists; cannot merge. Skip (fail safe).
+        return ("skip", _AMM_REASON_DISABLED)
+
+    integration = _integration_branch_name(queue_run_id)
+
+    # If the integration branch does not exist (e.g. parallel queue which
+    # never stacks), no-op -> skip. Stays queue-exhausted.
+    r_int = _checked(["rev-parse", "--verify", integration],
+                     "rev-parse integration")
+    if r_int is None:
+        return ("skip", _AMM_REASON_DISABLED)
+    if r_int.returncode != 0:
+        return ("skip", _AMM_REASON_DISABLED)
+
+    # Checkout the base branch (the merge target).
+    r_co = _checked(["checkout", base], "checkout base")
+    if r_co is None:
+        return ("skip", _AMM_REASON_DISABLED)
+    if r_co.returncode != 0:
+        return ("skip", _AMM_REASON_DISABLED)
+
+    # Merge the integration branch into base.
+    r_merge = _checked(["merge", "--no-ff", integration], "merge integration")
+    if r_merge is None:
+        return ("skip", _AMM_REASON_DISABLED)
+    if r_merge.returncode == 0:
+        r_sha = _checked(["rev-parse", base], "rev-parse base sha")
+        if r_sha is None or r_sha.returncode != 0:
+            # Merge succeeded but sha read failed; still report ok with the
+            # base name so the human can inspect.
+            return ("ok", f"main-merged:{base}")
+        sha = r_sha.stdout.decode("utf-8", errors="replace").strip()
+        return ("ok", f"main-merged:{sha}")
+
+    # Conflict path: best-effort abort, never force.
+    r_abort = _checked(["merge", "--abort"], "abort conflict")
+    if r_abort is None:
+        print("main-merge: git merge --abort could not be executed",
+              file=sys.stderr)
+    elif r_abort.returncode != 0:
+        print("main-merge: git merge --abort failed", file=sys.stderr)
+    return ("halt", _AMM_REASON_CONFLICT)
+
+
+def _apply_main_merge(queue_run_id: str, base_outcome: str,
+                      target: Optional[str]) -> str:
+    """Apply the queue-exhaustion main-merge hop to a parent-log outcome.
+
+    ISSUE-0011: invoked before each ``queue-exhausted`` finalize site. On
+    ``ok`` the outcome becomes ``main-merged:<sha>``; on ``halt`` it becomes
+    ``main-merge-conflict:<queue_run_id>``; on ``skip`` the caller's original
+    ``queue-exhausted`` outcome is preserved unchanged.
+    """
+    decision, reason = _auto_merge_integration_to_main(queue_run_id, target)
+    if decision == "ok":
+        return reason            # "main-merged:<sha>"
+    if decision == "halt":
+        return f"{reason}:{queue_run_id}"   # "main-merge-conflict:<id>"
+    return base_outcome          # skip -> unchanged queue-exhausted
+
+
+
 
 def _create_parent_log(run_id: str, start_issue: Optional[str],
                        config: Dict[str, Any],
@@ -649,6 +798,8 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
         # exhausted (all known work consumed). Only the truly idle case
         # (no gates, no approved) is a no-op.
         outcome = "queue-exhausted" if gates_resolved else "noop-empty-queue"
+        if outcome == "queue-exhausted":
+            outcome = _apply_main_merge(queue_run_id, outcome, target)
         _finalize_parent_log(queue_run_id, outcome, target)
         print("queue: exhausted" if gates_resolved
               else "queue: no approved issues; nothing to do")
@@ -687,16 +838,21 @@ def _run_queue(start_issue: Optional[str], target: Optional[str],
             idx += 1
             continue
 
+        if outcome == "queue-exhausted":
+            outcome = _apply_main_merge(queue_run_id, outcome, target)
         _finalize_parent_log(queue_run_id, outcome, target)
         print(f"queue halted: {outcome}")
         # Expected halts (clean skill handoff) exit 0; unexpected halts
         # (blocked terminal, non-terminal, unmet dep, held lock) non-zero.
         if outcome.startswith(("merge-", "queue-exhausted",
+                               "main-merged", "main-merge-conflict",
                                "max-queue-run-reached", "noop-")):
             return queue_run_id, EXIT_OK
         return queue_run_id, EXIT_INVALID
 
-    _finalize_parent_log(queue_run_id, "queue-exhausted", target)
+    outcome = "queue-exhausted"
+    outcome = _apply_main_merge(queue_run_id, outcome, target)
+    _finalize_parent_log(queue_run_id, outcome, target)
     print(f"queue: exhausted approved issues")
     return queue_run_id, EXIT_OK
 
@@ -1220,6 +1376,173 @@ def selftest() -> int:
                     "auto-merge integration: merged file missing")
         finally:
             shutil.rmtree(repo_i, ignore_errors=True)
+
+        # --- ISSUE-0011: _auto_merge_integration_to_main -----------------
+        # 1. flag off (default) -> skip, disabled.
+        # 2. clean merge + pytest pass -> ok, main-merged:<sha>.
+        # 3. conflict -> halt, main-merge-conflict.
+        # 4. tests fail -> skip, tests-failed (integration branch intact).
+
+        def _make_repo_am1(base_branch: str) -> str:
+            """Repo with auto-merge-branch + auto_merge_main enabled."""
+            repo = tempfile.mkdtemp(prefix="laplace-amm-")
+            _git(["init", "-q", f"--initial-branch={base_branch}"], repo)
+            _git(["config", "user.email", "self@test"], repo)
+            _git(["config", "user.name", "selftest"], repo)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("init\n")
+            _git(["add", "README.md"], repo)
+            _git(["commit", "-q", "-m", "init"], repo)
+            return repo
+
+        def _write_passing_tests(repo: str) -> None:
+            os.makedirs(os.path.join(repo, "tests"), exist_ok=True)
+            with open(os.path.join(repo, "tests", "test_ok.py"), "w") as f:
+                f.write("def test_ok():\n    assert True\n")
+
+        def _write_failing_tests(repo: str) -> None:
+            os.makedirs(os.path.join(repo, "tests"), exist_ok=True)
+            with open(os.path.join(repo, "tests", "test_bad.py"), "w") as f:
+                f.write("def test_bad():\n    assert False, 'boom'\n")
+
+        def _enable_main_merge(repo: str) -> None:
+            """Flip the config to auto-merge-branch + main-merge on."""
+            assert state.cmd_init(target=repo) == 0
+            cfg_path = os.path.join(repo, ".harness", "config.yml")
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                txt = f.read()
+            txt = txt.replace("merge_policy: wait-for-human-merge",
+                              "merge_policy: auto-merge-branch")
+            txt = txt.replace("auto_merge_main_at_exhaustion: false",
+                              "auto_merge_main_at_exhaustion: true")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(txt)
+
+        # 1. Flag off (default config) -> skip, disabled.
+        repo_off = _make_repo_am1("main")
+        try:
+            assert state.cmd_init(target=repo_off) == 0
+            dec_off = _auto_merge_integration_to_main("amm-1", repo_off)
+            if dec_off != ("skip", "disabled"):
+                failures.append(
+                    f"main-merge flag off should be ('skip','disabled'), "
+                    f"got {dec_off!r}")
+        finally:
+            shutil.rmtree(repo_off, ignore_errors=True)
+
+        # 2. Clean merge + passing pytest -> ok, main-merged:<sha>.
+        repo_ok = _make_repo_am1("main")
+        try:
+            _enable_main_merge(repo_ok)
+            _write_passing_tests(repo_ok)
+            # Build integration branch with one new commit ahead of main.
+            _git(["checkout", "-q", "-b",
+                  _integration_branch_name("amm-2")], repo_ok)
+            with open(os.path.join(repo_ok, "feature.txt"), "w") as f:
+                f.write("feat\n")
+            _git(["add", "feature.txt"], repo_ok)
+            _git(["commit", "-q", "-m", "integration work"], repo_ok)
+            _git(["checkout", "-q", "main"], repo_ok)
+            dec_ok = _auto_merge_integration_to_main("amm-2", repo_ok)
+            if dec_ok[0] != "ok" or not dec_ok[1].startswith("main-merged:"):
+                failures.append(
+                    f"main-merge clean should be (ok, 'main-merged:<sha>'), "
+                    f"got {dec_ok!r}")
+            else:
+                sha = dec_ok[1].split(":", 1)[1]
+                # main must now contain feature.txt and be at the reported sha.
+                if not os.path.exists(os.path.join(repo_ok, "feature.txt")):
+                    failures.append(
+                        "main-merge clean: feature.txt missing on main")
+                r_main_sha = subprocess.run(
+                    ["git", "-C", repo_ok, "rev-parse", "main"],
+                    capture_output=True, text=True)
+                if r_main_sha.stdout.strip() != sha:
+                    failures.append(
+                        f"main-merge clean: reported sha {sha!r} != main "
+                        f"head {r_main_sha.stdout.strip()!r}")
+        finally:
+            shutil.rmtree(repo_ok, ignore_errors=True)
+
+        # 3. Conflict -> halt, main-merge-conflict.
+        repo_conf = _make_repo_am1("main")
+        try:
+            _enable_main_merge(repo_conf)
+            _write_passing_tests(repo_conf)
+            # Integration branch and main both modify README.md differently.
+            _git(["checkout", "-q", "-b",
+                  _integration_branch_name("amm-3")], repo_conf)
+            with open(os.path.join(repo_conf, "README.md"), "w") as f:
+                f.write("integration\n")
+            _git(["add", "README.md"], repo_conf)
+            _git(["commit", "-q", "-m", "integration edit"], repo_conf)
+            _git(["checkout", "-q", "main"], repo_conf)
+            with open(os.path.join(repo_conf, "README.md"), "w") as f:
+                f.write("main-side\n")
+            _git(["add", "README.md"], repo_conf)
+            _git(["commit", "-q", "-m", "main edit"], repo_conf)
+            dec_conf = _auto_merge_integration_to_main("amm-3", repo_conf)
+            if dec_conf != ("halt", "main-merge-conflict"):
+                failures.append(
+                    f"main-merge conflict should be "
+                    f"('halt','main-merge-conflict'), got {dec_conf!r}")
+            # After abort, HEAD must resolve (no stuck merge state) and main
+            # must be unchanged (still 'main-side').
+            r_head3 = subprocess.run(
+                ["git", "-C", repo_conf, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True)
+            if r_head3.returncode != 0 or r_head3.stdout.strip() != "main":
+                failures.append(
+                    "main-merge conflict: HEAD not on main after abort")
+            with open(os.path.join(repo_conf, "README.md")) as f:
+                if f.read() != "main-side\n":
+                    failures.append(
+                        "main-merge conflict: main content changed")
+        finally:
+            shutil.rmtree(repo_conf, ignore_errors=True)
+
+        # 4. Tests fail -> skip, tests-failed; integration branch intact.
+        repo_tf = _make_repo_am1("main")
+        try:
+            _enable_main_merge(repo_tf)
+            _write_failing_tests(repo_tf)
+            _git(["checkout", "-q", "-b",
+                  _integration_branch_name("amm-4")], repo_tf)
+            with open(os.path.join(repo_tf, "feature.txt"), "w") as f:
+                f.write("feat\n")
+            _git(["add", "feature.txt"], repo_tf)
+            _git(["commit", "-q", "-m", "integration work"], repo_tf)
+            _git(["checkout", "-q", "main"], repo_tf)
+            dec_tf = _auto_merge_integration_to_main("amm-4", repo_tf)
+            if dec_tf != ("skip", "tests-failed"):
+                failures.append(
+                    f"main-merge tests-failed should be "
+                    f"('skip','tests-failed'), got {dec_tf!r}")
+            # main must NOT contain the integration work (no merge happened).
+            if os.path.exists(os.path.join(repo_tf, "feature.txt")):
+                failures.append(
+                    "main-merge tests-failed: feature.txt leaked to main")
+            # Integration branch must still exist (preserved for human).
+            r_int = subprocess.run(
+                ["git", "-C", repo_tf, "rev-parse", "--verify",
+                 _integration_branch_name("amm-4")],
+                capture_output=True)
+            if r_int.returncode != 0:
+                failures.append(
+                    "main-merge tests-failed: integration branch lost")
+        finally:
+            shutil.rmtree(repo_tf, ignore_errors=True)
+
+        # 5. Non-repo target -> skip, not-a-git-repo.
+        tmp_amm_nr = tempfile.mkdtemp(prefix="laplace-amm-nr-")
+        try:
+            dec_nr = _auto_merge_integration_to_main("amm-5", tmp_amm_nr)
+            if dec_nr != ("skip", "not-a-git-repo"):
+                failures.append(
+                    f"main-merge non-repo should be "
+                    f"('skip','not-a-git-repo'), got {dec_nr!r}")
+        finally:
+            shutil.rmtree(tmp_amm_nr, ignore_errors=True)
 
         # --- Characterization: runner primitives unaffected --------------
         # Direct runner.cmd_start + cmd_end still works (no queue_runner).
