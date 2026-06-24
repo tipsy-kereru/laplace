@@ -115,6 +115,10 @@ Optionally remove the marketplace:
 /plugin marketplace remove tipsy-kereru/laplace
 ```
 
+Removing the plugin deletes only its own files. Per-project runtime
+state under `.harness/` (issues, run logs, approvals) is intentionally
+kept — delete that directory by hand if you want a clean slate.
+
 ---
 
 ## Installation — Codex CLI (instruction-only tier)
@@ -128,7 +132,20 @@ codex
 ```
 
 Open `/plugins`, select the `laplace` marketplace, and install `laplace`.
-Then start a new thread.
+Then start a new thread. This same install also covers the Codex desktop
+app — restart the app after installing and it picks up the plugin.
+
+There is **no `/hooks` trust step** for Laplace on Codex. Ponytail and
+other Codex plugins that ship Node.js lifecycle hooks require that step;
+Laplace's hooks are Claude Code event-shaped Python and do not register
+on Codex, so there is nothing to trust. (See the limitation below.)
+
+### Global (Codex extension for VS Code, all projects)
+
+The Codex extension for VS Code reads `AGENTS.md`. To run Laplace's
+procedure globally, copy this repo's [`AGENTS.md`](AGENTS.md) to
+`~/.codex/AGENTS.md`. Per-project, it loads automatically when you run
+Codex from a checkout of this repo.
 
 ### Upgrade
 
@@ -139,9 +156,20 @@ codex plugin update laplace
 ### Uninstall
 
 ```
-codex plugin uninstall laplace
+codex plugin remove laplace
 codex plugin marketplace remove tipsy-kereru/laplace   # optional
 ```
+
+Removing the plugin deletes only its own files. Per-project runtime
+state under `.harness/` (issues, run logs, approvals) is intentionally
+kept — delete that directory by hand if you want a clean slate.
+
+### Commands on Codex
+
+Codex surfaces plugin commands as skills invoked with `@` (not `/`).
+Examples: `@laplace:intake docs/prd.md`, `@laplace:run ISSUE-0001`,
+`@laplace:status`. The same commands that are `/laplace:*` on Claude
+Code become `@laplace:*` on Codex.
 
 ### Important limitation — instruction-only on Codex
 
@@ -163,8 +191,9 @@ adapter**:
   on Claude Code.
 
 This is the same tier Ponytail and similar skills expose on
-Cursor/Windsurf/Cline — rules in, no hooks. The canonical, enforced
-experience remains Claude Code.
+Cursor/Windsurf/Cline — rules in, no hooks. A future SPEC may port the
+deny-layer checks to a Codex Node.js hook; until then, the canonical
+enforced experience remains Claude Code.
 
 ---
 
