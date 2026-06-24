@@ -20,7 +20,7 @@ stdlib-only.
 
 import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # --- Policy precedence metadata -------------------------------------------------
 
@@ -111,10 +111,14 @@ MAX_DIFF_LINES_WITHOUT_APPROVAL = 1000
 MAX_STOP_HOOK_ITERATIONS = 12
 
 
-def check_command(cmd: str) -> Tuple[bool, str]:
+def check_command(cmd: str, target: Optional[str] = None) -> Tuple[bool, str]:
     """Return (allowed, reason). If denied, allowed=False and reason is a
     sanitized, redaction-safe explanation. Approval-required commands return
     (False, 'requires approval: <rule>') so callers can distinguish.
+
+    SPEC-007: approval-kind commands (not in FLAT_DENY_COMMANDS) are
+    short-circuited when freerange is active for their key. The deny path
+    is untouched — freerange never suppresses FLAT_DENY_COMMANDS.
     """
     if not isinstance(cmd, str) or not cmd.strip():
         return True, ""
@@ -122,6 +126,14 @@ def check_command(cmd: str) -> Tuple[bool, str]:
         if pat.search(cmd):
             if rule in FLAT_DENY_COMMANDS:
                 return False, f"denied: {reason}"
+            # SPEC-007: consult freerange. Import deferred to avoid a
+            # circular import at module load (freerange imports state).
+            try:
+                import freerange  # type: ignore
+                if freerange.suppressed_by_freerange(rule, target):
+                    return True, f"allowed: freerange suppresses {rule}"
+            except Exception:
+                pass  # freerange unavailable -> fail to approval-required
             return False, f"requires approval: {reason}"
     return True, ""
 

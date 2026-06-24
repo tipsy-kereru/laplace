@@ -5,6 +5,39 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.0] — 2026-06-24
+
+### Added
+
+- **SPEC-007: freerange scope override.** `/laplace:freerange on {flow|publish|supply|all}`
+  suppresses Laplace's approval layer so the loop can run unattended.
+  Human-only (slash command), scope-bounded, TTL-limited (24h default,
+  168h ceiling). Audit log at `.harness/logs/freerange.jsonl`.
+  - `flow`: auto-approve drafts (bypasses the `/laplace:approve` gate and
+    the pipeline approve-gate halt).
+  - `publish`: allow `git push`, `gh pr create`, `npm publish` without approval.
+  - `supply`: allow `pip install`, `npm install`, `claude mcp add` without approval.
+  - `all`: union of the above.
+  - **Not a security boundary** (SPEC-002 NG-007). A determined agent
+    with Bash can defeat it. The deny layer (`rm -rf /`, `curl|sh`,
+    `sudo`, `ssh`, `aws`, `gcloud`, `kubectl`) is never consulted or
+    suppressed by freerange. `aws`/`gcloud`/`kubectl` remain
+    approval-required under every scope (intentionally unsuppressed —
+    cloud production access).
+
+### Changed
+
+- `policy.py:check_command` accepts an optional `target` and consults
+  freerange on the approval path. Deny path unchanged.
+- `state.cmd_approve` records `user="freerange"` when `flow` is active.
+- `pipeline.py:_phase_approve_gate` skips the halt and auto-approves
+  drafts when `flow` is active.
+
+### Tests
+
+- `tests/test_spec007_freerange.py` (19). Suite: 315 passing, zero
+  regressions against 0.6.0.
+
 ## [0.6.0] — 2026-06-24
 
 Four opt-in features extending the loop with type-aware evidence gates,

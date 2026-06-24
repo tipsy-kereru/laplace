@@ -219,6 +219,27 @@ def _phase_approve_gate(log: Dict[str, Any], args: argparse.Namespace,
     drafts = _drafts(target)
     auto = bool(log.get("auto_approve_low_risk"))
 
+    # SPEC-007: when freerange `flow` is active, the approve-gate halt is
+    # skipped and all drafts are auto-approved via cmd_approve with
+    # user="freerange" (matching the --auto-approve-low-risk precedent).
+    try:
+        import freerange  # type: ignore
+        flow_active = freerange.suppressed_by_freerange(
+            "issue_approval", target)
+    except Exception:
+        flow_active = False
+    if flow_active and drafts:
+        for iid in drafts:
+            ns = argparse.Namespace(issue_id=iid, target=target,
+                                    user="freerange")
+            state.cmd_approve(ns)
+        _record_phase(log, "approve-gate",
+                      f"freerange-flow approved {len(drafts)} drafts",
+                      target)
+        log["phase"] = "parallel"
+        _save_pipeline_log(log, target)
+        return None
+
     if auto:
         low_drafts: List[str] = []
         held_drafts: List[str] = []

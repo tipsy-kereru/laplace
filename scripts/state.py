@@ -1398,6 +1398,18 @@ def cmd_approve(args: argparse.Namespace) -> int:
     tasks = _load_tasks(args.target)
     issue_id = args.issue_id
     current = tasks.get(issue_id, {}).get("status", "draft")
+    # SPEC-007: when freerange `flow` is active, the draft->approved gate
+    # is suppressed. We still run validate_transition + dependency check
+    # (safety); we only skip the human-approval semantic. The audit
+    # entry records user="freerange" when the caller did not supply one.
+    try:
+        import freerange  # type: ignore
+        flow_active = freerange.suppressed_by_freerange(
+            "issue_approval", args.target)
+    except Exception:
+        flow_active = False
+    user = args.user or ("freerange" if flow_active
+                         else os.environ.get("USER", "unknown"))
     ok, reason = validate_transition(current, "approved")
     if not ok:
         print(f"cannot approve {issue_id}: {reason}", file=sys.stderr)
@@ -1407,8 +1419,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
         print(reason, file=sys.stderr)
         return 2
     _set_issue_state(issue_id, "approved", target=args.target)
-    _append_approval(issue_id, "approve", args.user or os.environ.get("USER", "unknown"),
-                     target=args.target)
+    _append_approval(issue_id, "approve", user, target=args.target)
     print(f"approved {issue_id}: {current} -> approved")
     return 0
 
