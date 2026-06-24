@@ -135,10 +135,13 @@ Open `/plugins`, select the `laplace` marketplace, and install `laplace`.
 Then start a new thread. This same install also covers the Codex desktop
 app — restart the app after installing and it picks up the plugin.
 
-There is **no `/hooks` trust step** for Laplace on Codex. Ponytail and
-other Codex plugins that ship Node.js lifecycle hooks require that step;
-Laplace's hooks are Claude Code event-shaped Python and do not register
-on Codex, so there is nothing to trust. (See the limitation below.)
+There is **no `/hooks` trust step** for Laplace on Codex unless the host
+requires it. Laplace ships one Node.js lifecycle hook
+(`hooks/laplace-activate.js`, SessionStart) that fires identically on
+Claude Code and Codex — the same portability pattern Ponytail uses. If
+Codex prompts you to trust lifecycle hooks on first install, accept it;
+the hook is read-only (reads `.harness/` state, injects a summary into
+the session).
 
 ### Global (Codex extension for VS Code, all projects)
 
@@ -171,29 +174,30 @@ Examples: `@laplace:intake docs/prd.md`, `@laplace:run ISSUE-0001`,
 `@laplace:status`. The same commands that are `/laplace:*` on Claude
 Code become `@laplace:*` on Codex.
 
-### Important limitation — instruction-only on Codex
+### What works on Codex vs Claude Code
 
-Laplace's hard policy hooks (`scripts/policy.py` deny layer, evidence
-gates, freerange suppression, motivation triggers) are Claude Code
-event-shaped Python. **They do not fire on Codex**, whose lifecycle
-hooks are Node.js. On Codex, Laplace runs as an **instruction-only
-adapter**:
+| Hook | Claude Code | Codex |
+|---|---|---|
+| SessionStart activation (`laplace-activate.js`, Node) | fires | fires |
+| UserPromptSubmit signal routing (`router.sh`) | fires | fires (POSIX hosts) |
+| PreToolUse deny layer + approval gates (`pretooluse.py`) | fires | **does not fire** |
+| PostToolUse evidence capture (`posttooluse.py`) | fires | **does not fire** |
+| Stop-loop continuation (`stop-loop.py`) | fires | **does not fire** |
 
-- The procedure (context before decomposition, scoped changes, evidence
-  before claim, stop at approval gates) is delivered to the model via
-  [`AGENTS.md`](AGENTS.md), which Codex auto-loads.
-- The Python scripts under `scripts/` are still on disk and can be
-  invoked via Bash (`python3 scripts/state.py status`, etc.) to read and
-  transition state, run verifications, and produce reports.
-- The model is trusted to self-enforce the approval gates (publish,
-  dependency install, credentials, destructive ops). Nothing blocks a
-  skip deterministically. If you need the hard enforcement, use Laplace
-  on Claude Code.
+So on Codex you get the SessionStart context injection (harness summary,
+queue counts, freerange status) and the procedure via
+[`AGENTS.md`](AGENTS.md). The hard deny layer, evidence gates, and
+stop-loop do **not** enforce — those events are Claude-Code-specific.
 
-This is the same tier Ponytail and similar skills expose on
-Cursor/Windsurf/Cline — rules in, no hooks. A future SPEC may port the
-deny-layer checks to a Codex Node.js hook; until then, the canonical
-enforced experience remains Claude Code.
+The Python scripts under `scripts/` are still on disk and can be invoked
+via Bash (`python3 scripts/state.py status`, etc.) to read and transition
+state, run verifications, and produce reports. The model is trusted to
+self-enforce the approval gates (publish, dependency install,
+credentials, destructive ops). If you need the hard enforcement, use
+Laplace on Claude Code.
+
+This matches the Ponytail tier: portable SessionStart activation in,
+event-specific enforcement Claude-Code-only.
 
 ---
 

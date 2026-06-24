@@ -5,6 +5,25 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.1] — 2026-06-25
+
+### Added
+
+- **Codex Node SessionStart hook** (`hooks/laplace-activate.js`). Pure-Node,
+  cross-platform activation that reads `.harness/` state and injects a
+  harness summary (queue counts, active run, freerange status, next-action
+  hint) into the session. Fires identically on Claude Code and Codex
+  (macOS/Linux/Windows). Mirrors the Ponytail `ponytail-activate.js`
+  portability pattern. Registered in `hooks/hooks.json` SessionStart
+  alongside the existing `router.sh`, with a `commandWindows` variant.
+
+### Changed
+
+- README Codex section replaced the "instruction-only" caveat with an
+  honest hook-by-hook table: SessionStart activation + UserPromptSubmit
+  routing fire on Codex; PreToolUse/PostToolUse/Stop (deny layer,
+  evidence gates, stop-loop) remain Claude-Code-only.
+
 ## [0.7.0] — 2026-06-24
 
 ### Added

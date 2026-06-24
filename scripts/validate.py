@@ -223,6 +223,9 @@ def check_hook_script_paths(root: str, rep: Report) -> None:
                 if not m:
                     continue
                 rel = m.group(1)
+                # Strip a trailing quote if the command quoted the path
+                # (e.g. node "${CLAUDE_PLUGIN_ROOT}/hooks/x.js").
+                rel = rel.rstrip('"').rstrip("'")
                 # Strip any args after the path (split on whitespace already done by \S+,
                 # but the path may itself have no spaces; verify file exists)
                 candidate = os.path.join(root, rel)

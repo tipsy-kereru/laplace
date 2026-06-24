@@ -62,6 +62,13 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/router.sh session-start",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/laplace-activate.js\"",
+            "commandWindows": "node \"%CLAUDE_PLUGIN_ROOT%\\hooks\\laplace-activate.js\"",
+            "timeout": 5,
+            "statusMessage": "Loading Laplace harness context..."
           }
         ]
       }
