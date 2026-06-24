@@ -47,7 +47,7 @@ Four opt-in features, all off by default — upgrading changes no existing loop:
 
 ## What's new in 0.7.0
 
-- **Freerange scope override** (SPEC-007) — `/laplace:freerange on {flow|publish|supply|all}` suppresses approval gates so the loop can run unattended. Human-only, scope-bounded, TTL-limited (24h default, 168h max). **Not a security boundary** — a determined agent can defeat it (same tier as all policy hooks). The deny layer (`rm -rf /`, `curl|sh`, `sudo`, cloud CLIs) is never suppressed. See `specs/SPEC-007-freerange-scope-override.md`.
+- **Freerange scope override** (SPEC-007) — `/laplace:freerange on {flow|publish|supply|all}` suppresses approval gates so the loop can run unattended. Human-only, scope-bounded, TTL-limited (24h default, 168h max). **Not a security boundary** — a determined agent can defeat it (same tier as all policy hooks). The deny layer (`rm -rf /`, `curl|sh`, `sudo`, cloud CLIs) is never suppressed. Practical patterns in [`docs/freerange-recipes.md`](docs/freerange-recipes.md); design in `specs/SPEC-007-freerange-scope-override.md`.
 
 See `CHANGELOG.md` and `specs/SPEC-003..007-*.md`.
 
