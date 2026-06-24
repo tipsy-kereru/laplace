@@ -117,6 +117,57 @@ Optionally remove the marketplace:
 
 ---
 
+## Installation — Codex CLI (instruction-only tier)
+
+Laplace also installs as a Codex plugin. Add the marketplace, then
+install inside an interactive session:
+
+```
+codex plugin marketplace add tipsy-kereru/laplace
+codex
+```
+
+Open `/plugins`, select the `laplace` marketplace, and install `laplace`.
+Then start a new thread.
+
+### Upgrade
+
+```
+codex plugin update laplace
+```
+
+### Uninstall
+
+```
+codex plugin uninstall laplace
+codex plugin marketplace remove tipsy-kereru/laplace   # optional
+```
+
+### Important limitation — instruction-only on Codex
+
+Laplace's hard policy hooks (`scripts/policy.py` deny layer, evidence
+gates, freerange suppression, motivation triggers) are Claude Code
+event-shaped Python. **They do not fire on Codex**, whose lifecycle
+hooks are Node.js. On Codex, Laplace runs as an **instruction-only
+adapter**:
+
+- The procedure (context before decomposition, scoped changes, evidence
+  before claim, stop at approval gates) is delivered to the model via
+  [`AGENTS.md`](AGENTS.md), which Codex auto-loads.
+- The Python scripts under `scripts/` are still on disk and can be
+  invoked via Bash (`python3 scripts/state.py status`, etc.) to read and
+  transition state, run verifications, and produce reports.
+- The model is trusted to self-enforce the approval gates (publish,
+  dependency install, credentials, destructive ops). Nothing blocks a
+  skip deterministically. If you need the hard enforcement, use Laplace
+  on Claude Code.
+
+This is the same tier Ponytail and similar skills expose on
+Cursor/Windsurf/Cline — rules in, no hooks. The canonical, enforced
+experience remains Claude Code.
+
+---
+
 ## Usage guide
 
 For detailed walkthroughs with realistic examples (first-time setup, bug-fix loop, dependency gate, cancel/resume, blocked issues), see **[docs/USAGE.md](docs/USAGE.md)**.
