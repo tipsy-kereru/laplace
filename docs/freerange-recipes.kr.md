@@ -2,152 +2,149 @@
 
 **언어:** [English](freerange-recipes.md) | 한국어
 
-`/laplace:freerange` (SPEC-007, v0.7.0+) 실용 사용 패턴.
+`/laplace:freerange` (SPEC-007, v0.7.0 이상)의 실용적인 사용 패턴을 모았습니다.
 
-**먼저 읽기:** Freerange는 편의 보조 도구, **보안 경계가 아님**
-(SPEC-002 NG-007). 협조적 루프는 무인으로 동작; 결심된 모델은 우회 가능.
-deny 층(`rm -rf /`, `curl|sh`, `sudo`, `aws`, `gcloud`, `kubectl`)은 구조적으로
-절대 억제 안 됨. 전체 설계와 한계는 [specs/SPEC-007](../specs/SPEC-007-freerange-scope-override.md).
+**먼저 읽어주세요.** Freerange는 편의를 위한 보조 도구이지 **보안 경계가 아닙니다** (SPEC-002 NG-007). 협조적으로 동작하는 루프는 무인으로 잘 돌아가지만, 결심한 모델이라면 우회할 수 있습니다. deny 층(`rm -rf /`, `curl|sh`, `sudo`, `aws`, `gcloud`, `kubectl`)은 구조상 절대 억제되지 않습니다. 전체 설계와 한계는 [specs/SPEC-007](../specs/SPEC-007-freerange-scope-override.md)를 참고하세요.
 
 ## 스코프 요약
 
-| 스코프 | 잠금 해제 | 위험 |
+| 스코프 | 풀리는 것 | 위험 |
 |---|---|---|
-| `flow` | 드래프트 자동 승인. 외부 효과 없음. | 낮음. |
+| `flow` | 드래프트 자동 승인. 외부 효과는 없습니다. | 낮음. |
 | `publish` | `git push`, `gh pr create`, `npm publish`. | 중간 — 되돌릴 수 없는 외부 게시. |
-| `supply` | `pip install`, `npm install`, `claude mcp add`. | 높음 — 모델이 자기 능력 표면 확장. |
-| `all` | 위 셋. | 높음 — deny 층 제외 엔드투엔드 자율. |
+| `supply` | `pip install`, `npm install`, `claude mcp add`. | 높음 — 모델이 자기 능력 표면을 스스로 넓힙니다. |
+| `all` | 위 셋을 모두. | 높음 — deny 층만 남기고 엔드투엔드로 자율 동작. |
 
-`flow`가 안전한 기본값. `publish`/`supply`/`all`은 짧은 TTL과 명확한 이유가 있을 때만.
+`flow`가 안전한 기본값입니다. `publish`, `supply`, `all`은 짧은 TTL과 분명한 이유가 있을 때만 쓰세요.
 
 ---
 
 ## 레시피 1 — 밤새 백로그 소각 (권장 진입점)
 
-**목표:** 저위험 이슈의 승인 백로그를 밤새 처리, 매 게이트마다 인간 없이.
+**목표.** 저위험 이슈로 이루어진 승인 백로그를 밤새 처리하되, 매 게이트마다 사람이 필요하지는 않게 합니다.
 
-**설정:**
+**설정.**
 ```
 /laplace:intake docs/prd-batch.md          # PRD -> 드래프트
-/laplace:verify                            # 드래프트 점검
-/laplace:approve ISSUE-0001                # 인간이 한 번 승인 (작업 원함)
-...                                        # 배치 승인
+/laplace:verify                            # 드래프트 건강 점검
+/laplace:approve ISSUE-0001                # 사람이 한 번 승인 (작업을 원한다는 뜻)
+...                                        # 배치를 승인
 /laplace:freerange on flow --ttl 8         # 8시간 창, flow만
-/laplace:run-queue                         # 큐가 루프 통해 자동 진행
+/laplace:run-queue                         # 큐가 루프를 따라 자동으로 진행
 ```
 
-**무슨 일:** 각 승인 이슈가 PM → dev → review → security → review-passed 실행. `flow` 없으면 큐가 매 드래프트-승인 재진입마다 정지. `flow`면 엔드투엔드. push·설치 없음 — 이슈가 아침 리뷰용 `review-passed`에 도착.
+**무슨 일이 일어나는가.** 각 승인 이슈가 PM → dev → review → security → review-passed를 거칩니다. `flow`가 켜져 있지 않으면 큐는 매 드래프트-승인 재진입마다 멈춥니다. `flow`가 켜지면 엔드투엔드로 돕니다. push도 설치도 없습니다. 이슈들은 아침 리뷰를 위해 `review-passed`에 도착합니다.
 
-**아침:** `/laplace:status` → 배치가 `review-passed`. 인간이 diff 리뷰 후 이슈별 `/laplace:create-pr` (게시는 여전히 게이트 — 의도적).
+**아침.** `/laplace:status`를 보면 배치가 `review-passed`에 있습니다. 사람이 diff를 리뷰한 뒤, 이슈별로 `/laplace:create-pr`을 실행합니다 (게시는 여전히 게이트에 걸립니다. 의도된 동작입니다).
 
-**왜 `all`이 아니라 `flow`:** 인간이 게시 단계를 보길 원함. 밤새 자율은 *검토 가능한* 산출물을 만들어야, 게시된 산출물이 아니라.
+**왜 `all`이 아니라 `flow`인가.** 사람이 게시 단계를 보길 원하기 때문입니다. 밤새 자율로 돌았다면 산출물은 *검토할 수 있는* 상태여야지, 이미 게시된 상태가 아니어야 합니다.
 
-**안전망:** TTL이 스탠드업 전 만료. `/laplace:status`가 창 표시. 감사 로그가 매 전환 기록.
+**안전망.** TTL은 스탠드업 전에 만료됩니다. `/laplace:status`가 그 창을 보여줍니다. 감사 로그에 매 전환이 기록됩니다.
 
 ---
 
-## 레시피 2 — Cron 기반 자율 intake (SPEC-005 motivations와 결합)
+## 레시피 2 — cron으로 도는 자율 intake (SPEC-005 motivations와 결합)
 
-**목표:** 새 PRD가 리포에 들어오면 하네스가 잡아 드래프트 이슈 만들고 큐에 — 인간이 `/laplace:intake` 치지 않아도.
+**목표.** 새 PRD가 저장소에 들어오면 하네스가 그것을 잡아 드래프트 이슈로 만들고 큐에 넣습니다. 사람이 `/laplace:intake`를 부를 필요가 없게 합니다.
 
-**설정:** 외부 타이머(cron)가 motivations와 intake-check 모두 실행:
+**설정.** 외부 타이머(cron)가 motivations와 intake 점검을 함께 돌립니다.
 ```cron
-# 30분마다: motivation 틱 (승인 이슈 재개)
+# 30분마다: motivation 틱 (승인된 이슈를 재개)
 */30 * * * * cd /project && python3 scripts/motivations.py --once
-# 2시간마다: 새 PRD 스캔해 드래프트 이슈 생성 (당신의 wrapper)
+# 2시간마다: 새 PRD를 스캔해 드래프트 이슈를 만듭니다 (당신의 wrapper)
 0 */2 * * *   cd /project && your-intake-wrapper.sh
 ```
 
-래퍼가 드래프트 만들 때 자동 승인 발화하도록 `flow`를 짧은 TTL로 활성화:
+래퍼가 드래프트를 만들 때 자동 승인이 발화하도록, `flow`를 짧은 TTL로 켜둡니다.
 ```
 /laplace:freerange on flow --ttl 4
 ```
 
-**무슨 일:** PRD 커밋 → 래퍼가 드래프트 intake → `flow`가 자동 승인 → motivations가 큐 재개 → 이슈 진행. 인간은 다음 세션에 리뷰.
+**무슨 일이 일어나는가.** PRD가 커밋되면 래퍼가 드래프트를 intake하고, `flow`가 자동 승인하고, motivations가 큐를 재개하고, 이슈가 진행됩니다. 사람은 다음 세션에서 리뷰합니다.
 
-**왜 작동:** SPEC-005 (motivations)가 승인 작업 재개; SPEC-007 (`flow`)가 draft→approved 게이트를 허물어 파이프라인이 `review-passed`까지 진짜 무인 엔드투엔드.
+**왜 작동하는가.** SPEC-005(motivations)가 승인된 작업을 재개하고, SPEC-007(`flow`)이 draft→approved 게이트를 허물어, 파이프라인이 `review-passed`까지 진짜로 무인 엔드투엔드로 돕니다.
 
-**한계:** `flow` TTL 4시간. 매 세션마다 재장전. `flow`를 영구히 켜두지 말 것 — 의도 안 한 드래프트가 자동 승인됨.
+**한계.** `flow` TTL은 4시간입니다. 매 세션마다 다시 장전하세요. `flow`를 켜둔 채로 두지 마세요. 의도하지 않은 드래프트가 자동 승인될 수 있습니다.
 
 ---
 
-## 레시피 3 — 신뢰 릴리스 파이프라인 (publish, 좁은 창)
+## 레시피 3 — 신뢰하는 릴리스 파이프라인 (publish, 좁은 창)
 
-**목표:** 리뷰된 게시 준비 릴리스가 push, PR 열기, 게시를 인간이 세 게이트 클릭 없이 — 단 의도적 릴리스 세션 중에만.
+**목표.** 리뷰를 마친 게시 준비 릴리스가, 사람이 세 개의 게이트를 일일이 클릭하지 않아도, push하고 PR을 열고 게시합니다. 단지 의도적인 릴리스 세션 동안에만.
 
-**설정:**
+**설정.**
 ```
-/laplace:status                           # 이슈가 review-passed 확인
+/laplace:status                           # 이슈가 review-passed인지 확인
 /laplace:freerange on publish --ttl 1     # 1시간 릴리스 창
 /laplace:release ISSUE-0042               # push -> PR -> 게시 실행
-/laplace:freerange off                    # 직후 창 닫기
+/laplace:freerange off                    # 직후 창을 닫습니다
 ```
 
-**무슨 일:** `publish`가 게시 층 세 승인을 1시간 억제. 릴리스가 단계별 프롬프트 없이 완료.
+**무슨 일이 일어나는가.** `publish`가 게시 층의 세 가지 승인을 한 시간 동안 억제합니다. 릴리스가 단계별 프롬프트 없이 완료됩니다.
 
-**왜 `--ttl 1`:** 릴리스는 개별 행동. 창을 날이 아니라 작업에 맞춤. 릴리스 게시되는 순간 수동으로 닫기 — `off`가 런북의 일부, 사후 생각이 아님.
+**왜 `--ttl 1`인가.** 릴리스는 개별적인 행동입니다. 창을 하루 전체가 아니라 작업에 맞추세요. 릴리스가 게시되는 순간 수동으로 창을 닫으세요. `off`는 런북의 일부이지, 사후 생각이 아닙니다.
 
-**`supply`와 절대 조합 말 것:** 릴리스 세션은 새 의존성이 필요 없음. 릴리스 중 루프가 `pip install`에 손대면 그건 `supply` 켜라가 아니라 멈추라는 신호.
+**`supply`와 절대로 조합하지 마세요.** 릴리스 세션은 새 의존성을 필요로 하지 않습니다. 릴리스 도중 루프가 `pip install`에 손을 대려 한다면, 그것은 `supply`를 켜라는 신호가 아니라 멈추라는 신호입니다.
 
 ---
 
-## 레시피 4 — 의존성 업그레이드 스윕 (supply, 최고 경고)
+## 레시피 4 — 의존성 업그레이드 스윕 (supply, 가장 주의)
 
-**목표:** 여러 이슈에 걸쳐 통제된 의존성 업그레이드(이슈당 `pip install --upgrade`)를 각 설치 승인 없이 실행.
+**목표.** 여러 이슈에 걸쳐 (이슈마다 `pip install --upgrade`가 붙은) 통제된 의존성 업그레이드를 돌리되, 매 설치마다 승인을 받지 않도록 합니다.
 
-**설정:**
+**설정.**
 ```
-# 사전 준비: 모든 업그레이드가 회귀 테스트 있는 승인된 이슈.
+# 사전 준비: 모든 업그레이드는 회귀 테스트가 딸린 승인된 이슈여야 합니다.
 /laplace:freerange on supply --ttl 2      # 2시간 창, supply만
 /laplace:run-queue
 /laplace:freerange off
 ```
 
-**무슨 일:** 각 이슈의 dev 단계가 승인 정지 없이 업그레이드 설치. review와 security 게이트는 여전히 발화 (`supply`에 없음).
+**무슨 일이 일어나는가.** 각 이슈의 dev 단계가 승인 정지 없이 자기 업그레이드를 설치합니다. review와 security 게이트는 여전히 발화합니다 (그것들은 `supply`에 들어있지 않습니다).
 
-**왜 가장 위험한 레시피:** `supply`는 모델이 자기 도구 표면(새 패키지, 새 MCP 서버)을 확장하게 함. 악의적이거나 버그 있는 패키지가 무인으로 들어옴. 완화:
-- 특정 업그레이드 사전 승인 (이슈가 정확한 버전 명시).
-- 창 짧게.
-- 후에 감사 로그 검토: `grep '"event": "on"' .harness/logs/freerange.jsonl`.
-- 여기서 절대 `all` 쓰지 말 것 — 잘못된 업그레이드가 게시되지 않게 게시는 게이트 유지.
+**왜 가장 위험한 레시피인가.** `supply`는 모델이 스스로 도구 표면을 넓히도록(새 패키지, 새 MCP 서버) 허용합니다. 악의적이거나 버그가 있는 패키지가 무인으로 들어옵니다. 완화 방법은 다음과 같습니다.
+
+- 특정 업그레이드를 사전에 승인합니다 (이슈가 정확한 버전을 명시하도록).
+- 창을 짧게 유지합니다.
+- 뒤따라 감사 로그를 검토합니다. `grep '"event": "on"' .harness/logs/freerange.jsonl`.
+- 여기서는 절대 `all`을 쓰지 마세요. 잘못된 업그레이드가 게시되지 않도록 게시는 게이트에 묶어둬야 합니다.
 
 ---
 
-## 레시피 5 — 데모 / 샌드박스 풀자율 (all, 일회용 리포)
+## 레시피 5 — 데모 / 샌드박스 풀자율 (all, 일회용 저장소)
 
-**목표:** 루프가 엔드투엔드 뭘 할 수 있는지 보여주거나, 나쁜 커밋 게시가 허용되는 일회용 실험 실행.
+**목표.** 루프가 엔드투엔드로 무엇을 할 수 있는지 보여주거나, 나쁜 커밋이 게시되어도 괜찮은 일회용 실험을 돌립니다.
 
-**설정:**
+**설정.**
 ```
-/laplace:freerange on all --ttl 1         # 1시간, deny 층 제외 풀자율
+/laplace:freerange on all --ttl 1         # 1시간, deny 층만 남긴 풀자율
 /laplace:pipeline                         # intake -> approve -> run -> push -> PR
 ```
 
-**무슨 일:** 전체 파이프라인이 게시까지 무인 실행. deny 층 명령은 여전히 차단.
+**무슨 일이 일어나는가.** 전체 파이프라인이 게시까지 무인으로 돕니다. deny 층 명령은 여전히 차단됩니다.
 
-**샌드박스에서만:** fork, feature 브랜치, 일회용 리포 사용. 프로덕션 main 브랜치에서 절대. deny 층은 호스트 보호(`rm -rf /`); 리포의 main 브랜치를 나쁜 자동-게시에서 보호하진 않음.
+**샌드박스에서만.** fork나 feature 브랜치, 혹은 일회용 저장소에서 쓰세요. 프로덕션 main 브랜치에서는 절대 쓰지 마세요. deny 층은 호스트를 보호합니다(`rm -rf /`). 하지만 리포지토리의 main 브랜치를 나쁜 자동-게시로부터 보호하지는 않습니다.
 
 ---
 
-## 안티-레시피 (이것들 하지 말 것)
+## 안티 레시피 (이런 일은 하지 마세요)
 
-- **`/laplace:freerange on all`을 main에서 기본 TTL로.** 프로덕션 브랜치에 24시간 풀자율 창은 무인 나쁜 게시 자초. 레시피 3 대신 (좁은 게시 창).
-- **세션 사이에 `supply` 켜두기.** 모델이 당신이 없는 동안 도달 범위 확장하는 도구 설치 가능. 작업별 재장전, 후에 닫기.
-- **freerange를 샌드박스로 취급.** 아님. *승인*을 억제, *실행*이 아님. 탈취 결정한 모델이 `policy.py` 직접 편집 가능. Freerange가 그걸 막지 않고 결코 막는다고 주장 안 함.
-- **이해 못 하는 게이트를 우회하려 freerange 켜기.** `pip install`이 계속 정지하면, 게이트 억제 전에 왜(어떤 이슈, 어떤 의존성) 알아내기. 억제는 신호를 숨김.
+- **main에서 `/laplace:freerange on all`을 기본 TTL로.** 프로덕션 브랜치에서 24시간 풀자율 창을 여는 것은 무인으로 나쁜 게시가 일어나길 바라는 것과 같습니다. 레시피 3(좁은 게시 창)을 대신 쓰세요.
+- **세션 사이에 `supply`를 켜둔 채로.** 모델이 당신이 자리를 비운 사이에 도달 범위를 넓히는 도구를 설치할 수 있습니다. 작업마다 다시 장전하고, 끝나면 닫으세요.
+- **freerange를 샌드박스로 취급.** 아닙니다. freerange는 *승인*을 억제하지 *실행*을 억제하지는 않습니다. 탈취를 결심한 모델은 `policy.py`를 직접 편집할 수 있습니다. freerange는 그것을 막지 않으며, 막는다고 주장한 적도 없습니다.
+- **이해하지 못하는 게이트를 우회하려고 freerange 켜기.** `pip install`이 계속 멈춘다면, 게이트를 억제하기 전에 왜(어떤 이슈, 어떤 의존성)인지 알아내세요. 억제는 신호를 숨깁니다.
 
 ---
 
 ## 운영 위생
 
-- **세션별 재장전, 후에 닫기.** 기본 TTL 24시간은 안전을 위한 상한, 목표가 아님. `--ttl`로 작업에 맞춤.
-- **감사 로그 읽기.** `.harness/logs/freerange.jsonl`은 append-only. `grep '"event": "on"'`이 스코프와 TTL로 매 활성화 표시.
-- **먼저 `/laplace:status` 확인.** 상단에 활성 스코프와 남은 시간 표시. 깜짝 활성화 없음.
-- **`/laplace:freerange off`는 항상 안전.** 확인 불필요. 게이트 복원엔 게이트 없음.
+- **세션마다 다시 장전하고, 끝나면 닫기.** 기본 TTL 24시간은 안전을 위한 상한이지 목표가 아닙니다. `--ttl`로 작업에 맞추세요.
+- **감사 로그 읽기.** `.harness/logs/freerange.jsonl`은 append-only입니다. `grep '"event": "on"'`이 켤 때마다 스코프와 TTL을 보여줍니다.
+- **먼저 `/laplace:status` 확인.** 상단에 활성 스코프와 남은 시간이 표시됩니다. 깜짝 활성화는 없습니다.
+- **`/laplace:freerange off`는 언제나 안전.** 확인이 필요 없습니다. 게이트를 복구하는 데 게이트는 없습니다.
 
 ## 함께 보기
 
 - [SPEC-007](../specs/SPEC-007-freerange-scope-override.md) — 설계, 스코프 카탈로그, 한계.
 - [SPEC-005](../specs/SPEC-005-motivation-triggers.md) — motivations, `flow`의 cron 기반 동반자.
-- [SPEC-002 NG-007](../specs/SPEC-002-laplace-claude-code-plugin.md) —
-  "policy hooks are not a hard security sandbox", freerange 티어의 권위.
+- [SPEC-002 NG-007](../specs/SPEC-002-laplace-claude-code-plugin.md) — "policy hooks are not a hard security sandbox", freerange의 층을 정당화하는 근거.
