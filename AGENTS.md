@@ -1,5 +1,7 @@
 # AGENTS.md (Codex)
 
+**Language:** English | [한국어](AGENTS.kr.md)
+
 > Laplace runs on Codex at **full hook parity** with Claude Code.
 > Codex loads `hooks/hooks.json`, sets `CLAUDE_PLUGIN_ROOT`, and
 > dispatches the same lifecycle events (PreToolUse, PostToolUse, Stop,
@@ -83,7 +85,8 @@ skills (invoke with `@`). The primary ones:
 - `@laplace:run-queue` — approved backlog as a queue.
 - `@laplace:status` — current harness state.
 - `@laplace:freerange <on|off|status>` — approval-gate override
-  (Claude Code only on Codex — the override has no hooks to suppress).
+  (suppresses the approval layer; works on both Claude Code and Codex
+  since the hooks fire identically).
 
 The Python scripts under `scripts/` (state machine, runner, policy,
 cost-watcher, motivations, freerange) are the canonical logic. They are

@@ -1,5 +1,7 @@
 # Freerange Recipes
 
+**Language:** English | [한국어](freerange-recipes.kr.md)
+
 Practical usage patterns for `/laplace:freerange` (SPEC-007, v0.7.0+).
 
 **Read first:** Freerange is a convenience aid, **not a security boundary**

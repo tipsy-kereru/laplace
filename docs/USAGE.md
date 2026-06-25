@@ -1,5 +1,7 @@
 # Laplace — Usage Guide
 
+**Language:** English | [한국어](USAGE.kr.md)
+
 End-to-end walkthroughs with realistic examples. Read the [README](../README.md) first for installation, philosophy, and architecture.
 
 Laplace runs **inside your target project** (the codebase you want Laplace to work on), not inside the `laplace/` plugin repo itself.
