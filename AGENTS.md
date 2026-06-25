@@ -1,10 +1,11 @@
-# AGENTS.md (Codex / instruction-only tier)
+# AGENTS.md (Codex)
 
-> Laplace on Codex runs as an **instruction-only adapter**: this file
-> carries the procedure; the hard policy hooks (deny layer, evidence
-> gates, freerange suppression) do **not** fire on Codex because they
-> are Claude Code event-shaped Python. The model is trusted to follow
-> the procedure. For full enforcement, use Laplace on Claude Code.
+> Laplace runs on Codex at **full hook parity** with Claude Code.
+> Codex loads `hooks/hooks.json`, sets `CLAUDE_PLUGIN_ROOT`, and
+> dispatches the same lifecycle events (PreToolUse, PostToolUse, Stop,
+> SessionStart, UserPromptSubmit). The deny layer, evidence gates, and
+> stop-loop all enforce. This file carries the procedure the model
+> should follow on top of that enforcement.
 
 ## What Laplace is
 
@@ -54,7 +55,7 @@ block you. Surface the gate to the human and wait.
    network, release: stop at the gate and ask. Even if you *could* run
    the command, the human decides.
 
-## Approval gates (self-enforced on Codex)
+## Approval gates (enforced on Codex)
 
 Stop and surface to the human before:
 
@@ -66,9 +67,10 @@ Stop and surface to the human before:
   shared branches).
 - Release transitions (`release-candidate → done`).
 
-The Claude Code plugin enforces these via `scripts/policy.py`. On Codex,
-**you** enforce them by not running the command without explicit human
-confirmation.
+These are enforced by `scripts/policy.py` via the PreToolUse hook, which
+fires identically on Codex. The deny layer (`rm -rf /`, `curl|sh`,
+`sudo`, cloud CLIs) blocks outright; the approval layer halts the loop
+until a human confirms (or freerange suppresses it).
 
 ## Slash commands
 
@@ -84,11 +86,9 @@ skills (invoke with `@`). The primary ones:
   (Claude Code only on Codex — the override has no hooks to suppress).
 
 The Python scripts under `scripts/` (state machine, runner, policy,
-cost-watcher, motivations, freerange) are the canonical logic. On Codex
-you can invoke them directly via Bash (`python3 scripts/state.py ...`)
-to read or transition state. The policy deny-layer does not fire on
-Codex, so you are responsible for respecting the approval categories
-above.
+cost-watcher, motivations, freerange) are the canonical logic. They are
+invoked identically on Codex (via the lifecycle hooks) and directly via
+Bash (`python3 scripts/state.py ...`) to read or transition state.
 
 ## State on disk
 
@@ -104,12 +104,11 @@ above.
 
 Read state before acting. Write evidence after acting.
 
-## When Codex is not enough
+## When the harness is not enough
 
 If you find the model routinely skipping a gate that the procedure
-requires, switch to Laplace on Claude Code — the hooks there block the
-skip deterministically. This file cannot; it relies on the model
-following instructions.
+requires despite the hooks, file an issue — the hooks are designed to
+block the skip deterministically on both Claude Code and Codex.
 
 See `specs/SPEC-002-laplace-claude-code-plugin.md` for the canonical
 design and `README.md` for install paths.

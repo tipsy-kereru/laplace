@@ -5,6 +5,28 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.2] — 2026-06-25
+
+### Changed (documentation correction)
+
+- **Codex runs at full hook parity with Claude Code.** Codex loads
+  `hooks/hooks.json`, sets `CLAUDE_PLUGIN_ROOT`, and dispatches the full
+  lifecycle event surface (PreToolUse, PostToolUse, Stop, SessionStart,
+  UserPromptSubmit, SubagentStart/Stop, PostToolUseFailure). The 0.7.0
+  "instruction-only tier" and 0.7.1 "SessionStart only" framings were
+  **wrong** — the deny layer, evidence gates, and stop-loop all enforce
+  on Codex exactly as on Claude Code. Per the
+  [Codex hooks documentation](https://developers.openai.com/codex/hooks)
+  and [Build plugins](https://developers.openai.com/codex/plugins/build).
+- README Codex section rewritten: parity table now shows every hook
+  firing on both hosts. The 0.7.1 Node activation hook remains valuable
+  for Windows Codex (where `router.sh` cannot run).
+- `AGENTS.md` subtitle and approval-gate section updated: gates are
+  enforced, not self-enforced.
+
+No code changes. The hooks were already correct; only the docs
+overclaimed the limitation.
+
 ## [0.7.1] — 2026-06-25
 
 ### Added
