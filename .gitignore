@@ -93,3 +93,8 @@ logs/
 .scratch/
 *.tmp
 tmp/
+
+# ---- Internal planning docs (not bundled with the plugin release) ----
+specs/
+docs/prd-*.md
+docs/audit-*.md

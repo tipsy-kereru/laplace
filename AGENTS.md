@@ -113,5 +113,4 @@ If you find the model routinely skipping a gate that the procedure
 requires despite the hooks, file an issue — the hooks are designed to
 block the skip deterministically on both Claude Code and Codex.
 
-See `specs/SPEC-002-laplace-claude-code-plugin.md` for the canonical
-design and `README.md` for install paths.
+See `README.md` for install paths. (Design notes live under `specs/` in the source repository and are not bundled with the plugin release.)

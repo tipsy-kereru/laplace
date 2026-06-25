@@ -4,12 +4,12 @@
 
 Practical usage patterns for `/laplace:freerange` (SPEC-007, v0.7.0+).
 
-**Read first:** Freerange is a convenience aid, **not a security boundary**
-(SPEC-002 NG-007). A cooperative loop runs unattended; a determined model
-can defeat it. The deny layer (`rm -rf /`, `curl|sh`, `sudo`, `aws`,
-`gcloud`, `kubectl`) is never suppressed by construction. See
-[specs/SPEC-007](../specs/SPEC-007-freerange-scope-override.md) for the
-full design and limits.
+**Read first:** Freerange is a convenience aid, **not a security boundary**.
+A cooperative loop runs unattended; a determined model can defeat it. The
+deny layer (`rm -rf /`, `curl|sh`, `sudo`, `aws`, `gcloud`, `kubectl`) is
+never suppressed by construction. (Design notes for SPEC-007 live under
+`specs/` in the source repository and are not bundled with the plugin
+release.)
 
 ## Scope reminder
 
@@ -196,10 +196,7 @@ bad auto-publish.
 
 ## See also
 
-- [SPEC-007](../specs/SPEC-007-freerange-scope-override.md) — design,
-  scope catalog, limits.
-- [SPEC-005](../specs/SPEC-005-motivation-triggers.md) — motivations,
-  the cron-driven companion to `flow`.
-- [SPEC-002 NG-007](../specs/SPEC-002-laplace-claude-code-plugin.md) —
-  "policy hooks are not a hard security sandbox", the authority for
-  freerange's tier.
+- Motivation triggers (SPEC-005) — the cron-driven companion to `flow`.
+  Documented in `CHANGELOG.md` under v0.6.0.
+- Freerange design notes (SPEC-007) — live under `specs/` in the source
+  repository; the scope catalog and limits in this recipe summarize them.

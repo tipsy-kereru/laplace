@@ -36,7 +36,7 @@ The goal is not autonomy. It is **traceable, reviewable, stoppable** engineering
 
 ## Status
 
-Draft. MVP scope: P0–P6. See `specs/SPEC-002-laplace-claude-code-plugin.md` for the full specification.
+Draft. MVP scope: P0–P6. (Design notes live in the source repository under `specs/` and are not bundled with the plugin release.)
 
 ## What's new in 0.6.0
 
@@ -49,9 +49,9 @@ Four opt-in features, all off by default — upgrading changes no existing loop:
 
 ## What's new in 0.7.0
 
-- **Freerange scope override** (SPEC-007) — `/laplace:freerange on {flow|publish|supply|all}` suppresses approval gates so the loop can run unattended. Human-only, scope-bounded, TTL-limited (24h default, 168h max). **Not a security boundary** — a determined agent can defeat it (same tier as all policy hooks). The deny layer (`rm -rf /`, `curl|sh`, `sudo`, cloud CLIs) is never suppressed. Practical patterns in [`docs/freerange-recipes.md`](docs/freerange-recipes.md); design in `specs/SPEC-007-freerange-scope-override.md`.
+- **Freerange scope override** (SPEC-007) — `/laplace:freerange on {flow|publish|supply|all}` suppresses approval gates so the loop can run unattended. Human-only, scope-bounded, TTL-limited (24h default, 168h max). **Not a security boundary** — a determined agent can defeat it (same tier as all policy hooks). The deny layer (`rm -rf /`, `curl|sh`, `sudo`, cloud CLIs) is never suppressed. Practical patterns in [`docs/freerange-recipes.md`](docs/freerange-recipes.md).
 
-See `CHANGELOG.md` and `specs/SPEC-003..007-*.md`.
+See `CHANGELOG.md` for the full version history.
 
 ---
 
@@ -398,7 +398,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 ## Source of truth
 
 - Usage guide: `docs/USAGE.md`
-- Specification: `specs/SPEC-002-laplace-claude-code-plugin.md`
+- Specification: design notes live under `specs/` in the source repository (not bundled with the plugin release)
 - Harness design (this project): `.moon-cell/docs/harness/`
 - Runtime state: `.harness/` (owned by Laplace, created by `/laplace:init`)
 - Version: `VERSION`, `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` (kept in sync; the release workflow verifies all three)

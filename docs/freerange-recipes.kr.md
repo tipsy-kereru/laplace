@@ -4,7 +4,7 @@
 
 `/laplace:freerange` (SPEC-007, v0.7.0 이상)의 실용적인 사용 패턴을 모았습니다.
 
-**먼저 읽어주세요.** Freerange는 편의를 위한 보조 도구이지 **보안 경계가 아닙니다** (SPEC-002 NG-007). 협조적으로 동작하는 루프는 무인으로 잘 돌아가지만, 결심한 모델이라면 우회할 수 있습니다. deny 층(`rm -rf /`, `curl|sh`, `sudo`, `aws`, `gcloud`, `kubectl`)은 구조상 절대 억제되지 않습니다. 전체 설계와 한계는 [specs/SPEC-007](../specs/SPEC-007-freerange-scope-override.md)를 참고하세요.
+**먼저 읽어주세요.** Freerange는 편의를 위한 보조 도구이지 **보안 경계가 아닙니다**. 협조적으로 동작하는 루프는 무인으로 잘 돌아가지만, 결심한 모델이라면 우회할 수 있습니다. deny 층(`rm -rf /`, `curl|sh`, `sudo`, `aws`, `gcloud`, `kubectl`)은 구조상 절대 억제되지 않습니다. (SPEC-007 설계 노트는 소스 저장소의 `specs/`에 있으며 플러그인 릴리스에는 번들되지 않습니다.)
 
 ## 스코프 요약
 
@@ -145,6 +145,5 @@
 
 ## 함께 보기
 
-- [SPEC-007](../specs/SPEC-007-freerange-scope-override.md) — 설계, 스코프 카탈로그, 한계.
-- [SPEC-005](../specs/SPEC-005-motivation-triggers.md) — motivations, `flow`의 cron 기반 동반자.
-- [SPEC-002 NG-007](../specs/SPEC-002-laplace-claude-code-plugin.md) — "policy hooks are not a hard security sandbox", freerange의 층을 정당화하는 근거.
+- 동기 트리거 (SPEC-005) — `flow`의 cron 기반 동반자. `CHANGELOG.md`의 v0.6.0 항목을 참고하세요.
+- Freerange 설계 노트 (SPEC-007) — 소스 저장소의 `specs/`에 있습니다. 이 레시피의 스코프 카탈로그와 한계가 그 내용을 요약합니다.
