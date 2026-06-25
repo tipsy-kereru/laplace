@@ -5,6 +5,27 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.3] — 2026-06-25
+
+### Added — Codex plugin discovery (fixes "plugin not found in /plugins")
+
+- **`.codex-plugin/plugin.json`** — the Codex-required plugin manifest
+  (entry point). Codex looks for this exact path; without it the
+  marketplace lists the plugin but Codex cannot load it. Mirrors the
+  Claude Code manifest with Codex-native fields (`interface.displayName`,
+  `homepage`, `license`, `keywords`).
+- **`.agents/plugins/marketplace.json`** — the Codex-native marketplace
+  catalog with the required `source.path`, `policy.installation`,
+  `policy.authentication`, and `category` fields. Codex reads this in
+  preference to the legacy `.claude-plugin/marketplace.json`.
+
+### Changed
+
+- README (en + ko) Codex install section: added the mandatory `/hooks`
+  trust step. Per Codex docs, plugin-bundled hooks are non-managed and
+  Codex skips them until the user reviews and trusts them — the previous
+  "no /hooks step" claim was wrong.
+
 ## [0.7.2] — 2026-06-25
 
 ### Changed (documentation correction)

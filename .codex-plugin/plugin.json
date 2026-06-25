@@ -1,0 +1,21 @@
+{
+  "name": "laplace",
+  "version": "0.7.3",
+  "description": "Local AI engineering loop execution harness. Converts PRDs or stories into local issues, routes each issue through scoped agent phases, runs verification, records evidence, and stops at explicit human approval gates. Works without Moon Cell; consumes .moon-cell/ profiles when present.",
+  "author": {
+    "name": "tipsy-kereru",
+    "url": "https://github.com/tipsy-kereru/laplace"
+  },
+  "homepage": "https://github.com/tipsy-kereru/laplace",
+  "repository": "https://github.com/tipsy-kereru/laplace",
+  "license": "MIT",
+  "keywords": ["harness", "loop", "engineering", "agents", "workflow"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Laplace",
+    "shortDescription": "Local AI engineering loop harness with procedure enforcement",
+    "longDescription": "Laplace converts PRDs or stories into local issues, routes each through scoped PM/Dev/Review/Security phases, records evidence at every step, and stops at explicit human approval gates before irreversible actions. Procedure over capability; local-first; evidence before claim.",
+    "developerName": "tipsy-kereru",
+    "category": "Productivity"
+  }
+}

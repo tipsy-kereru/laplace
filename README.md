@@ -134,8 +134,13 @@ codex
 ```
 
 Open `/plugins`, select the `laplace` marketplace, and install `laplace`.
-Then start a new thread. This same install also covers the Codex desktop
-app — restart the app after installing and it picks up the plugin.
+Codex discovers the plugin via `.agents/plugins/marketplace.json` and
+`.codex-plugin/plugin.json`. After install, open `/hooks` and trust the
+bundled lifecycle hooks (`router.sh`, `laplace-activate.js`,
+`pretooluse.py`, `posttooluse.py`, `stop-loop.py`) — Codex skips
+plugin-bundled hooks until you review and trust them. Then start a new
+thread. This same install also covers the Codex desktop app — restart
+the app after installing and it picks up the plugin.
 
 ### Hook parity with Claude Code
 

@@ -1,0 +1,20 @@
+{
+  "name": "laplace",
+  "interface": {
+    "displayName": "Laplace"
+  },
+  "plugins": [
+    {
+      "name": "laplace",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
