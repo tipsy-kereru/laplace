@@ -5,6 +5,45 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.4] — 2026-06-27
+
+### Added
+
+- **SPEC-008: auto decision log.** Decision-worthy transitions
+  (`review → review-passed`, `review → needs-fix`,
+  `security-review → {needs-fix,review-passed,human-approval-required}`)
+  append a one-line entry to `.harness/memory/decisions.md` with
+  timestamp, issue, phase, verdict, and a redacted 200-char rationale.
+  The PM phase reads the last 20 entries into the run-log context, so
+  scope clarification sees what was recently decided. New helpers:
+  `state._append_decision`, `state._read_decisions_tail`.
+- **SPEC-010: `ci-signal` motivation trigger.** Polls `gh run list` for
+  failed CI runs on the base branch, maps each to the issue whose
+  commit message contains `ISSUE-NNNN`, and transitions the owning
+  issue: `review-passed → needs-fix` (or `release-candidate → blocked`
+  with reason `ci-failure:<run-id>`). Failed runs are deduped via
+  `.harness/state/ci-seen.json`. Default off. New state-machine exit
+  `review-passed → needs-fix` (TERMINAL_STATES unchanged; queue
+  semantics preserved). Resolves SPEC-005 audit B11.
+
+### Changed
+
+- **SPEC-009: "Loop limits" doc section.** README (en + ko) gains an
+  honest section naming the three operational limits: model can misread
+  intent, autonomy scales error cost, human is the final verifier.
+  AGENTS (en + ko) gains a one-paragraph note cross-linking to it.
+  Replaces an earlier false claim about a "PM Socratic interview" with
+  real mitigations (`Stop, don't guess`, type-aware evidence gates,
+  draft→approved human gate).
+
+### Tests
+
+- `tests/test_spec008_decision_log.py` (8)
+- `tests/test_spec010_ci_signal.py` (10)
+- `tests/test_spec005_motivations.py` — fixed monkeypatch leak
+  (`del M.dispatch` → save/restore) that broke cross-test isolation.
+- Suite: 333 passing, zero regressions against 0.7.3.
+
 ## [0.7.3] — 2026-06-25
 
 ### Added — Codex plugin discovery (fixes "plugin not found in /plugins")

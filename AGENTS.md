@@ -113,4 +113,9 @@ If you find the model routinely skipping a gate that the procedure
 requires despite the hooks, file an issue — the hooks are designed to
 block the skip deterministically on both Claude Code and Codex.
 
+Three limits remain even with the harness: the model can misread intent,
+autonomy widens the blast radius of a bad decision (use scope + TTL), and
+no hook replaces human judgment on the final diff. See "Loop limits" in
+`README.md`.
+
 See `README.md` for install paths. (Design notes live under `specs/` in the source repository and are not bundled with the plugin release.)

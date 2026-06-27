@@ -403,6 +403,11 @@ def _create_run_log(issue_id: str, branch: BranchInfo,
         # `git worktree remove`.
         "worktree_path": branch.worktree_path,
     }
+    # SPEC-008: inject the last 20 decision lines as PM context, so the
+    # scope-clarification phase sees what was recently decided/rejected.
+    tail = state._read_decisions_tail(20, target)
+    if tail:
+        run["context"] = {"recent_decisions": tail}
     state._atomic_write_json(_run_log_path(run_id, target), run)
     return run_id
 
@@ -798,6 +803,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if summary:
         hist_line += f" :: {summary}"
     _append_run_history_to_issue(issue_id, hist_line, args.target)
+
+    # SPEC-008: append decision-worthy transitions to memory/decisions.md.
+    # Uses the post-redaction `summary` local (audit Q1: redaction happens
+    # AFTER _set_issue_state, so this MUST sit below line 788 to avoid
+    # leaking raw secrets).
+    if (args.from_state, args.to_state) in state.DECISION_WORTHY_TRANSITIONS:
+        verdict = state._DECISION_VERDICT.get(args.to_state, args.to_state)
+        state._append_decision(issue_id, args.from_state, verdict,
+                               summary, target=args.target)
 
     print(f"Laplace result: advanced")
     print(f"\nIssue: {issue_id}")

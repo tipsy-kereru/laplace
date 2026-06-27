@@ -24,6 +24,7 @@ stdlib only. Exit 0 on success (including opt-out and rate-limit no-ops).
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -313,11 +314,114 @@ def trigger_test_signal(tasks: Dict[str, Any], cfg: Dict[str, Any],
     return out
 
 
+# (TRIGGERS dict moved below trigger_ci_signal to avoid forward-ref at
+# module load.)
+
+
+# --- SPEC-010: ci-signal ---
+
+def _ci_seen_path(target: Optional[str]) -> str:
+    return os.path.join(state._state_dir(target), "ci-seen.json")
+
+
+def _load_ci_seen(target: Optional[str]) -> set:
+    data = state._read_json(_ci_seen_path(target), default=None)
+    if isinstance(data, dict):
+        return set(data.get("runs") or [])
+    return set()
+
+
+def _save_ci_seen(seen: set, target: Optional[str]) -> None:
+    path = _ci_seen_path(target)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    state._atomic_write_json(path, {"runs": sorted(seen)})
+
+
+def _git_commit_message(sha: str, target: Optional[str]) -> str:
+    """Return the commit message body for `sha`, or "" on any failure.
+
+    Tries `git show --no-patch --format=%B <sha>`. If the sha is
+    remote-only, runs `git fetch origin <sha>` first (best-effort).
+    """
+    root = state._harness_root(target)
+
+    def _show() -> str:
+        try:
+            r = subprocess.run(
+                ["git", "show", "--no-patch", "--format=%B", sha],
+                cwd=root, capture_output=True, timeout=15, check=False)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return ""
+
+    msg = _show()
+    if not msg:
+        try:
+            subprocess.run(["git", "fetch", "origin", sha],
+                           cwd=root, capture_output=True, timeout=30,
+                           check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        msg = _show()
+    return msg or ""
+
+
+def trigger_ci_signal(tasks: Dict[str, Any], cfg: Dict[str, Any],
+                      target: Optional[str], now: float) -> List[str]:
+    """Poll `gh run list` for failed CI runs; map each to an issue via the
+    commit message's ISSUE-NNNN token. Returns issue ids in `review-passed`
+    or `release-candidate` state whose CI just failed.
+
+    A run is acted on once per failure (recorded in ci-seen.json).
+    """
+    base = cfg.get("base_branch", "main")
+    try:
+        out = subprocess.run(
+            ["gh", "run", "list", "--branch", base,
+             "--status", "failure", "--limit", "5",
+             "--json", "databaseId,headSha"],
+            capture_output=True, timeout=30, check=False)
+        if out.returncode != 0:
+            return []
+        runs = json.loads(out.stdout.decode("utf-8", "replace") or "[]")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+    if not isinstance(runs, list):
+        return []
+
+    seen = _load_ci_seen(target)
+    candidates: List[str] = []
+    for r in runs:
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("databaseId", ""))
+        if not rid or rid in seen:
+            continue
+        sha = r.get("headSha") or ""
+        if not sha:
+            seen.add(rid)
+            continue
+        msg = _git_commit_message(sha, target)
+        m = re.search(r"ISSUE-(\d{4,})", msg)
+        seen.add(rid)
+        if not m:
+            continue
+        iid = "ISSUE-" + m.group(1)
+        st = tasks.get(iid, {}).get("status")
+        if st in ("review-passed", "release-candidate"):
+            candidates.append(iid)
+    _save_ci_seen(seen, target)
+    return candidates
+
+
 TRIGGERS = {
     "clock":        (trigger_clock,        ["approved"]),
     "git-upstream": (trigger_git_upstream, ["approved"]),
     "idle-queue":   (trigger_idle_queue,   ["approved"]),
     "test-signal":  (trigger_test_signal,  ["review"]),
+    "ci-signal":    (trigger_ci_signal,    ["review-passed", "release-candidate"]),
 }
 
 
@@ -326,7 +430,9 @@ TRIGGERS = {
 def dispatch(event_type: str, iid: str, target: Optional[str]) -> int:
     """Dispatch a motivation event. Routes through runner entry points.
 
-    test-signal -> review -> needs-fix (AC: only valid from review).
+    test-signal -> review -> needs-fix.
+    ci-signal   -> review-passed -> needs-fix, OR
+                   release-candidate -> blocked.
     others      -> approved -> pm-review via cmd_start (lock-protected).
 
     Returns 0 on success, non-zero on refusal (caller logs noop).
@@ -336,6 +442,20 @@ def dispatch(event_type: str, iid: str, target: Optional[str]) -> int:
         ns = argparse.Namespace(issue_id=iid, from_state="review",
                                 to_state="needs-fix", summary="", target=target)
         return runner.cmd_advance(ns)
+    if event_type == "ci-signal":
+        tasks = state._load_tasks(target)
+        st = tasks.get(iid, {}).get("status")
+        if st == "review-passed":
+            ns = argparse.Namespace(issue_id=iid, from_state="review-passed",
+                                    to_state="needs-fix",
+                                    summary="CI failure", target=target)
+            return runner.cmd_advance(ns)
+        if st == "release-candidate":
+            state._set_issue_state(
+                iid, "blocked", target=target,
+                block_reason="ci-failure")
+            return 0
+        return 1  # state changed under us; noop
     ns = argparse.Namespace(issue_id=iid, target=target)
     return runner.cmd_start(ns)
 

@@ -88,7 +88,7 @@ VALID_TRANSITIONS: Dict[str, List[str]] = {
     # runner routes security-review -> review-passed directly. cost-review
     # never bypasses review-passed, so AC-LP-008 still fires on release.
     "cost-review": ["review-passed", "human-approval-required", "blocked"],
-    "review-passed": ["release-candidate", "blocked"],
+    "review-passed": ["release-candidate", "blocked", "needs-fix"],
     "release-candidate": ["done", "blocked"],
     "done": [],
     "blocked": ["human-resolution"],
@@ -430,6 +430,72 @@ def _append_approval(issue_id: str, action: str, user: str,
         f.write(line + "\n")
 
 
+# SPEC-008: agent decision log. Append-only markdown under memory/decisions.md.
+# Records WHY a review/security/cost verdict was reached, one line per
+# decision-worthy transition. Survives compaction/restart for next-session
+# context. rationale MUST already be redacted by the caller.
+DECISION_RATIONALE_MAX = 200
+
+DECISION_WORTHY_TRANSITIONS = {
+    ("review", "needs-fix"),
+    ("review", "review-passed"),
+    ("security-review", "needs-fix"),
+    ("security-review", "review-passed"),
+    ("security-review", "human-approval-required"),
+}
+
+_DECISION_VERDICT = {
+    "review-passed": "pass",
+    "needs-fix": "needs-fix",
+    "human-approval-required": "blocked",
+    "blocked": "blocked",
+}
+
+
+def _append_decision(issue_id: str, phase: str, verdict: str,
+                     rationale: str, target: Optional[str] = None) -> None:
+    """Append one line to .harness/memory/decisions.md (SPEC-008).
+
+    Format:  <iso-ts> | <issue> | <phase> | <verdict> | <rationale>
+    rationale truncated to DECISION_RATIONALE_MAX chars, then redacted.
+    File created with the template header if absent.
+    """
+    path = os.path.join(_harness_root(target), ".harness", "memory",
+                        "decisions.md")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.exists(path):
+        _atomic_write_text(path, MEMORY_DECISIONS_TEMPLATE)
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time()))
+    rat = (rationale or "").strip()
+    if len(rat) > DECISION_RATIONALE_MAX:
+        rat = rat[:DECISION_RATIONALE_MAX - 1] + "…"
+    rat = _redact_evidence(rat)
+    line = f"- {iso} | {issue_id} | {phase} | {verdict} | {rat}\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def _read_decisions_tail(n: int = 20,
+                         target: Optional[str] = None) -> str:
+    """Return the last `n` decision lines from memory/decisions.md, or ''.
+
+    Used by cmd_start (PM phase entry) to give the PM agent recent-decision
+    context. Read-only; never raises.
+    """
+    path = os.path.join(_harness_root(target), ".harness", "memory",
+                        "decisions.md")
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return ""
+    # Skip the template header (lines starting with '#' or blank).
+    decisions = [ln for ln in lines if ln.startswith("- ")]
+    return "".join(decisions[-n:])
+
+
 # --- Config template (G-LP-004) -------------------------------------------------
 
 CONFIG_YML_TEMPLATE = """\
@@ -486,6 +552,9 @@ motivations:
       idle_threshold_hours: 2
     test-signal:
       enabled: false
+    ci-signal:
+      enabled: false
+      base_branch: main
 redaction:
   enabled: true
   store_raw_command_output: false

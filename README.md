@@ -398,6 +398,16 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 - Does not access production secrets, databases, or infrastructure
 - Does not require Moon Cell — works with conservative defaults
 
+## Loop limits
+
+Laplace widens what an agent loop can do safely, but it does not remove the limits every loop has. Three matter in practice:
+
+1. **The model can misread intent.** Ambiguous prompts may be interpreted one way and proceeded with. The "stop, don't guess" rule in AGENTS.md, type-aware evidence gates (SPEC-003), and the draft → approved human gate reduce this; they do not eliminate it. If a scope decision looks wrong, halt and clarify.
+2. **Autonomy scales error cost.** The wider the loop's freedom, the larger the blast radius of one bad decision. `freerange all` on a production branch can ship a bad commit unattended; `freerange flow` on a feature branch produces reviewable output. Scope and TTL exist to bound this — use them. See `docs/freerange-recipes.md`.
+3. **The human is the final verifier.** No hook replaces judgment. The loop produces *reviewable* output (evidence, reports, diffs); it does not produce *trusted* output. Read the report, review the diff, then approve. The hard safety floor blocks the catastrophic cases; everything else is your call.
+
+These are the price of the design. A loop without limits is a loop without review — and unreviewed autonomy is the failure mode Laplace exists to prevent.
+
 ---
 
 ## Source of truth

@@ -101,11 +101,12 @@ def test_clock_fires_for_due_approved_issue():
     open(cfg_path, "w").write(text)
     _set_tasks(tmp, {"ISSUE-A": {"status": "approved", "updated_at": now}})
     dispatched = []
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda evt, iid, target: dispatched.append((evt, iid)) or 0
     try:
         M.run_once(target=tmp, now=now)
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
     events = _log_events(tmp)
     assert any(e["event"] == "dispatch" and e["trigger"] == "clock"
                and e["issue_id"] == "ISSUE-A" for e in events)
@@ -123,11 +124,12 @@ def test_clock_noop_on_non_approved():
                                          "due_within_hours: 200")
     open(cfg_path, "w").write(text)
     _set_tasks(tmp, {"ISSUE-A": {"status": "review-passed", "updated_at": now}})
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda *a, **k: 0
     try:
         M.run_once(target=tmp, now=now)
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
     events = _log_events(tmp)
     assert not any(e["event"] == "dispatch" and e["trigger"] == "clock"
                    for e in events)
@@ -138,11 +140,12 @@ def test_idle_queue_dispatches_when_inactive():
     _enable_motivations(tmp)
     now = time.time()
     _set_tasks(tmp, {"ISSUE-A": {"status": "approved", "updated_at": now}})
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda evt, iid, target: 0
     try:
         M.run_once(target=tmp, now=now)
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
     events = _log_events(tmp)
     assert any(e["trigger"] == "idle-queue" and e["event"] == "dispatch"
                for e in events)
@@ -162,6 +165,7 @@ def test_idle_queue_silent_when_active():
                          "run_id": run_id},
         "ISSUE-QUEUED": {"status": "approved", "updated_at": now},
     })
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda evt, iid, target: (_ for _ in ()).throw(
         AssertionError("should not dispatch when active"))
     try:
@@ -169,7 +173,7 @@ def test_idle_queue_silent_when_active():
     except AssertionError:
         raise
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
 
 
 def test_test_signal_only_acts_on_review():
@@ -189,11 +193,12 @@ def test_test_signal_only_acts_on_review():
         {"issue_id": "ISSUE-X", "status": "failing", "ts": now})
     # ISSUE-X in review-passed (not review) -> noop.
     _set_tasks(tmp, {"ISSUE-X": {"status": "review-passed", "updated_at": now}})
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda *a, **k: 0
     try:
         M.run_once(target=tmp, now=now)
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
     events = _log_events(tmp)
     assert not any(e.get("trigger") == "test-signal" and e["event"] == "dispatch"
                    for e in events), "test-signal must noop on review-passed"
@@ -211,11 +216,12 @@ def test_human_approval_required_never_dispatched():
     _set_tasks(tmp, {"ISSUE-H": {"status": "human-approval-required",
                                  "updated_at": now}})
     called = []
+    _orig_dispatch = M.dispatch
     M.dispatch = lambda *a, **k: called.append(a) or 0
     try:
         M.run_once(target=tmp, now=now)
     finally:
-        del M.dispatch
+        M.dispatch = _orig_dispatch
     assert called == []
 
 
