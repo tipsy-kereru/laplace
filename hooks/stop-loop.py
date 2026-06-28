@@ -34,6 +34,30 @@ except Exception:  # pragma: no cover - defensive default
 DEFAULT_COMPLETION_SIGNAL = "LAPLACE-P0P6-COMPLETE"
 
 
+# Phase 6: Loop ledger integration for context survival
+def _reconstruct_from_ledger(run_id: str) -> Optional[Dict[str, Any]]:
+    """Reconstruct context from loop ledger after compaction.
+
+    Args:
+        run_id: Run identifier
+
+    Returns:
+        Context dictionary or None if ledger unavailable
+    """
+    try:
+        import loop_ledger  # type: ignore
+    except ImportError:
+        return None
+
+    harness_root = os.getcwd()
+    context = loop_ledger.reconstruct_context(run_id, harness_root)
+
+    if context:
+        sys.stderr.write(f"stop-loop: reconstructed context from ledger for {run_id}\n")
+
+    return context
+
+
 def _state_path() -> str:
     return os.path.join(os.getcwd(), ".harness", "state", "active-loop.local.json")
 
@@ -179,6 +203,19 @@ def run() -> int:
     if not isinstance(state, dict):
         _quarantine(state_path, "state is not a dict")
         _emit_allow()
+
+    # Phase 6: Attempt to reconstruct context from ledger for compaction recovery
+    run_id = state.get("run_id")
+    if run_id:
+        ledger_context = _reconstruct_from_ledger(run_id)
+        if ledger_context:
+            # Update state with reconstructed context
+            state["ledger_context"] = ledger_context
+            # Check if ledger shows completion
+            if ledger_context.get("current_phase") == "completed":
+                sys.stderr.write("stop-loop: ledger shows run completed\n")
+                _delete_state(state_path)
+                _emit_allow()
 
     # 3. Validate numeric fields. Non-int -> quarantine + exit 0.
     iteration = state.get("iteration")

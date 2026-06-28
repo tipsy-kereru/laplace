@@ -72,9 +72,10 @@ INTAKE_LOCK_ID = "ISSUE-INTAKE"
 
 # --- State machine (SPEC-002 §State Machine) -----------------------------------
 
-VALID_TRANSITIONS: Dict[str, List[str]] = {
-    "draft": ["approved"],
-    "approved": ["pm-review", "blocked"],
+# Base transitions (existing states)
+_BASE_TRANSITIONS: Dict[str, List[str]] = {
+    "draft": ["approved"],  # Legacy direct path
+    "approved": ["pm-review", "run", "blocked"],  # run bypasses pm-review (opt-in)
     "pm-review": ["ready-for-dev", "blocked"],
     "ready-for-dev": ["in-progress", "blocked"],
     "in-progress": ["review", "blocked", "needs-fix", "human-approval-required"],
@@ -99,7 +100,29 @@ VALID_TRANSITIONS: Dict[str, List[str]] = {
     "cancelled": [],
 }
 
-QUEUE_STATES = ["draft", "approved", "in-progress", "blocked", "release-candidate"]
+# Phase 3: Multi-phase workflow extensions
+_WORKFLOW_TRANSITIONS: Dict[str, List[str]] = {
+    "draft": ["intent"],  # intent phase before approval (opt-in)
+    "intent": ["plan", "blocked"],
+    "plan": ["plan-audit", "blocked"],
+    "plan-audit": ["approved", "blocked"],  # PASS→approved, FAIL→blocked
+    "sync-audit": ["review-passed", "needs-fix", "blocked"],
+}
+
+# Merge transitions (workflow extensions add to base)
+VALID_TRANSITIONS: Dict[str, List[str]] = {}
+for state, transitions in _BASE_TRANSITIONS.items():
+    VALID_TRANSITIONS[state] = transitions.copy()
+
+for state, transitions in _WORKFLOW_TRANSITIONS.items():
+    if state in VALID_TRANSITIONS:
+        # Merge: add new transitions without duplicates
+        VALID_TRANSITIONS[state] = list(set(VALID_TRANSITIONS[state] + transitions))
+    else:
+        VALID_TRANSITIONS[state] = transitions.copy()
+
+QUEUE_STATES = ["draft", "intent", "plan", "plan-audit", "approved", "run",
+                "sync-audit", "in-progress", "blocked", "release-candidate"]
 
 TERMINAL_STATES = {"review-passed", "security-passed", "release-candidate",
                    "done", "blocked", "max-attempts-exceeded",
@@ -237,6 +260,91 @@ def validate_transition(from_state: str, to_state: str) -> Tuple[bool, str]:
     if to_state not in allowed:
         return False, f"invalid transition: {from_state} -> {to_state}"
     return True, "ok"
+
+
+# Phase 4: Evidence-driven completion gates
+# Evidence requirements per state transition. Keys are "from->to" strings;
+# values map required evidence kinds and verdict requirements.
+EVIDENCE_GATES: Dict[str, Dict[str, Any]] = {
+    "plan-audit -> approved": {
+        "required_kinds": ["spec-validation", "workflow-plan"],
+        "verdict_required": "PASS",
+        "description": "Plan audit must pass with spec validation and workflow plan"
+    },
+    "sync-audit -> review-passed": {
+        "required_kinds": ["test", "audit-report"],
+        "verdict_required": "PASS",
+        "description": "Sync audit must pass with test evidence and audit report"
+    },
+    "needs-fix -> in-progress": {
+        "required_kinds": ["review"],
+        "min_count": 1,
+        "description": "At least one review finding must be documented"
+    },
+}
+
+
+def check_evidence_gate(run_id: str, from_state: str, to_state: str,
+                        target: Optional[str] = None) -> Tuple[bool, str]:
+    """Check if transition has required evidence.
+
+    Args:
+        run_id: Run identifier
+        from_state: Source state
+        to_state: Target state
+        target: Repository root
+
+    Returns:
+        (ok, reason) tuple - True if gate passes or not required
+    """
+    transition_key = f"{from_state} -> {to_state}"
+    gate = EVIDENCE_GATES.get(transition_key)
+
+    if not gate:
+        return True, "No evidence gate for this transition"
+
+    # Load run log
+    run_log_path = os.path.join(_harness_root(target), ".harness",
+                                  "state", "runs", f"{run_id}.json")
+    if not os.path.exists(run_log_path):
+        return False, f"Run log not found: {run_log_path}"
+
+    run_log = _read_json(run_log_path, default={})
+    if not run_log:
+        return False, f"Failed to read run log"
+
+    evidence = run_log.get("evidence", [])
+    evidence_kinds = {e.get("kind") for e in evidence}
+
+    # Check required evidence kinds
+    required_kinds = gate.get("required_kinds", [])
+    missing = [k for k in required_kinds if k not in evidence_kinds]
+    if missing:
+        return False, f"Missing required evidence kinds: {missing}"
+
+    # Check min count if specified
+    min_count = gate.get("min_count")
+    if min_count is not None:
+        kind = required_kinds[0] if required_kinds else None
+        if kind:
+            count = sum(1 for e in evidence if e.get("kind") == kind)
+            if count < min_count:
+                return False, f"Need at least {min_count} {kind} entries, got {count}"
+
+    # Check verdict requirement if specified
+    verdict_required = gate.get("verdict_required")
+    if verdict_required:
+        # Look for audit-report evidence with PASS verdict
+        audit_evidence = [e for e in evidence if e.get("kind") == "audit-report"]
+        if not audit_evidence:
+            return False, "No audit report evidence found"
+
+        # Check if any audit report has the required verdict
+        has_pass = any("PASS" in e.get("summary", "").upper() for e in audit_evidence)
+        if not has_pass and verdict_required == "PASS":
+            return False, "Audit verdict is not PASS"
+
+    return True, "Evidence gate passed"
 
 
 def _check_dependency_graph(issue_id: str,
@@ -603,6 +711,27 @@ evidence_requirements:
     review: [visual]
   chore: {}
   security: {}
+
+# Phase 5: Orchestration mode selection
+# Defines how issues are executed based on complexity and context.
+orchestration:
+  default_mode: workflow
+
+  # Mode selection rules (evaluated in order)
+  mode_selection:
+    - condition: "files_changed >= 20"
+      mode: team
+    - condition: "dependencies.length > 3"
+      mode: workflow
+    - condition: "queue.length >= 3"
+      mode: parallel
+
+  # Mode switching permissions (prevents unintended mode changes)
+  allow_switching:
+    single: [team, workflow]
+    team: [workflow, parallel]
+    parallel: [team, workflow]
+    workflow: []  # No switching from workflow mode
 """
 
 AGENT_POLICY_TEMPLATE = """\

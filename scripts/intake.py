@@ -412,7 +412,8 @@ def json_dump_compact(obj: Any) -> str:
 # Core command
 # ---------------------------------------------------------------------------
 
-def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
+def cmd_intake(prd_path: str, target: Optional[str] = None,
+               to_intent: bool = False) -> int:
     root = state._harness_root(target)
     if not os.path.isdir(os.path.join(root, ".harness")):
         print(f"Laplace is not initialized at {root}. Run /laplace:init first.", file=sys.stderr)
@@ -513,6 +514,29 @@ def cmd_intake(prd_path: str, target: Optional[str] = None) -> int:
         state._save_queue(queue, target=target)
     finally:
         state.release_lock(_INTAKE_LOCK_ID, target=target)
+
+    # Phase 3: Transition to intent phase if requested
+    if to_intent and created:
+        tasks = state._load_tasks(target)
+        queue = state._load_queue(target)
+        intent_transitioned = []
+        for cid in created:
+            # Validate and transition draft -> intent
+            if cid in tasks and tasks[cid].get("status") == "draft":
+                ok, reason = state.validate_transition("draft", "intent")
+                if ok:
+                    state._set_issue_state(cid, "intent", target=target)
+                    # Update queue: remove from draft, add to intent
+                    if cid in queue["draft"]:
+                        queue["draft"].remove(cid)
+                    if "intent" not in queue:
+                        queue["intent"] = []
+                    queue["intent"].append(cid)
+                    intent_transitioned.append(cid)
+        state._save_queue(queue, target=target)
+        if intent_transitioned:
+            print(f"Laplace result: transitioned {len(intent_transitioned)} issues to intent phase")
+            print(f"Issues: {', '.join(intent_transitioned)}")
 
     # SPEC-002 §Output Format — Result template.
     print("Laplace result: intake complete")
@@ -879,7 +903,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         p.add_argument("prd", help="Path to PRD/story markdown file")
         p.add_argument("--target", default=None,
                        help="Repository root containing .harness/ (default: CWD)")
-        p.set_defaults(func=lambda a: cmd_intake(a.prd, a.target))
+        p.add_argument("--intent", action="store_true",
+                       help="Transition to intent phase after creation (Phase 3 workflow)")
+        p.set_defaults(func=lambda a: cmd_intake(a.prd, a.target, a.intent))
         p = sub.add_parser("selftest", help="Internal sanity checks")
         p.set_defaults(func=lambda a: selftest())
         args = parser.parse_args(argv)
@@ -890,8 +916,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("prd", help="Path to PRD/story markdown file")
     parser.add_argument("--target", default=None,
                         help="Repository root containing .harness/ (default: CWD)")
+    parser.add_argument("--intent", action="store_true",
+                        help="Transition to intent phase after creation (Phase 3 workflow)")
     args = parser.parse_args(argv)
-    return cmd_intake(args.prd, args.target)
+    return cmd_intake(args.prd, args.target, args.intent)
 
 
 if __name__ == "__main__":

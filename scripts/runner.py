@@ -41,8 +41,17 @@ MAX_FIX_ATTEMPTS = state.MAX_FIX_ATTEMPTS
 MAX_SECURITY_FIX_ATTEMPTS = state.MAX_SECURITY_FIX_ATTEMPTS
 
 BRANCH_PREFIX = "laplace"
-ALLOWED_EVIDENCE_KINDS = ("test", "review", "security", "manual", "command",
-                          "reproduction", "visual")
+# Phase 4: Extended evidence kinds (LazyCodex/MoAI-ADK patterns)
+ALLOWED_EVIDENCE_KINDS = (
+    "test", "review", "security", "manual", "command",
+    "reproduction", "visual",
+    # New evidence kinds for workflow automation
+    "spec-validation",     # SPEC/YAML frontmatter validation
+    "workflow-plan",       # Workflow plan document
+    "metric-capture",      # Performance/metric measurements
+    "integration-test",    # Integration test results
+    "audit-report",        # Auditor verdicts
+)
 EVIDENCE_SUMMARY_MAX = 1000
 
 # SPEC-003: per-type evidence requirements on state exits. Keys are issue
@@ -83,6 +92,148 @@ SECURITY_PATH_PATTERNS: Tuple[str, ...] = (
 EXTERNAL_API_MARKERS: Tuple[str, ...] = (
     "fetch(", "requests.", "http.", "axios.",
 )
+
+
+# ---------------------------------------------------------------------------
+# Auditor integration (Phase 2: Independent Auditors)
+# ---------------------------------------------------------------------------
+
+def _call_plan_auditor(issue_id: str, plan_path: str,
+                       harness_root: str, run_id: str) -> Tuple[bool, str]:
+    """Call the plan auditor to validate a workflow plan.
+
+    Args:
+        issue_id: Issue identifier
+        plan_path: Path to workflow plan file
+        harness_root: Path to .harness/ directory
+        run_id: Run identifier
+
+    Returns:
+        (ok, reason) tuple - True if auditor passes
+    """
+    try:
+        # Import component registry
+        import sys
+        sys.path.insert(0, os.path.join(HERE, ".."))
+        from components.verify import plan_auditor
+
+        # Create auditor component
+        auditor = plan_auditor.PlanAuditorComponent()
+
+        # Initialize if needed
+        auditor.initialize(harness_root)
+
+        # Execute audit
+        context = {
+            "issue_id": issue_id,
+            "plan_path": plan_path,
+            "harness_root": harness_root,
+            "run_id": run_id,
+        }
+        result = auditor.execute(context)
+
+        if result["success"]:
+            return True, f"Plan audit passed: {result['output']['audit_result']['reasoning']}"
+        else:
+            return False, f"Plan audit failed: {result.get('error', 'Unknown error')}"
+    except Exception as e:
+        # Auditor failure should not block - log and continue
+        return False, f"Plan audit error: {e}"
+
+
+def _call_sync_auditor(issue_id: str, run_id: str,
+                       harness_root: str) -> Tuple[bool, str]:
+    """Call the sync auditor to validate implementation results.
+
+    Args:
+        issue_id: Issue identifier
+        run_id: Run identifier
+        harness_root: Path to .harness/ directory
+
+    Returns:
+        (ok, reason) tuple - True if auditor passes
+    """
+    try:
+        # Import component registry
+        import sys
+        sys.path.insert(0, os.path.join(HERE, ".."))
+        from components.verify import sync_auditor
+
+        # Create auditor component
+        auditor = sync_auditor.SyncAuditorComponent()
+
+        # Initialize if needed
+        auditor.initialize(harness_root)
+
+        # Get run log path
+        run_log_path = os.path.join(harness_root, "state", "runs", f"{run_id}.json")
+
+        # Execute audit
+        context = {
+            "issue_id": issue_id,
+            "run_id": run_id,
+            "run_log": run_log_path,
+            "harness_root": harness_root,
+        }
+        result = auditor.execute(context)
+
+        if result["success"]:
+            return True, f"Sync audit passed: {result['output']['audit_result']['reasoning']}"
+        else:
+            return False, f"Sync audit failed: {result.get('error', 'Unknown error')}"
+    except Exception as e:
+        # Auditor failure should not block - log and continue
+        return False, f"Sync audit error: {e}"
+
+
+# Auditor integration points for state transitions
+AUDITOR_INTEGRATION = {
+    # Plan audit: pm-review -> ready-for-dev
+    ("pm-review", "ready-for-dev"): "plan",
+    # Sync audit: security-review -> review-passed
+    ("security-review", "review-passed"): "sync",
+    # Sync audit: cost-review -> review-passed (if cost_watcher enabled)
+    ("cost-review", "review-passed"): "sync",
+}
+
+
+def _check_auditor_gate(from_state: str, to_state: str,
+                        issue_id: str, harness_root: str,
+                        run_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Check if auditor gate is required for this transition.
+
+    Args:
+        from_state: Current state
+        to_state: Target state
+        issue_id: Issue identifier
+        harness_root: Path to .harness/ directory
+        run_id: Run identifier (optional for plan audit)
+
+    Returns:
+        (ok, reason) tuple - True if gate passes or not required
+    """
+    gate_type = AUDITOR_INTEGRATION.get((from_state, to_state))
+    if not gate_type:
+        return True, "No auditor gate for this transition"
+
+    if gate_type == "plan":
+        # Plan audit requires workflow plan file
+        plan_path = os.path.join(harness_root, "components", "workflow", "state.json")
+        if not os.path.exists(plan_path):
+            return False, f"Plan audit required but plan not found: {plan_path}"
+
+        # Use a default run_id for plan audit
+        audit_run_id = run_id or f"plan-{issue_id}"
+        return _call_plan_auditor(issue_id, plan_path, harness_root, audit_run_id)
+
+    elif gate_type == "sync":
+        # Sync audit requires run_id
+        if not run_id:
+            return False, "Sync audit requires run_id"
+
+        return _call_sync_auditor(issue_id, run_id, harness_root)
+
+    return True, "Unknown gate type - allowing"
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +875,34 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # survives the state change.
         state._save_tasks(tasks, target=args.target)
 
+    # Phase 2: Auditor integration (independent validation)
+    # Check auditor gates before transition - auditors can block transitions
+    # with FAIL verdicts. Fresh context prevents bias.
+    run_id = meta.get("run_id")
+    auditor_ok, auditor_reason = _check_auditor_gate(
+        args.from_state, args.to_state, issue_id, args.target, run_id
+    )
+    if not auditor_ok:
+        print(
+            f"advance failed: auditor gate blocked transition: {auditor_reason}",
+            file=sys.stderr,
+        )
+        return 4  # Use exit code 4 for auditor block (same as evidence gate)
+
+    # Phase 4: Evidence-driven completion gates
+    # Check evidence requirements before transition - required evidence kinds
+    # must be present in the run log.
+    if run_id:
+        evidence_ok, evidence_reason = state.check_evidence_gate(
+            run_id, args.from_state, args.to_state, args.target
+        )
+        if not evidence_ok:
+            print(
+                f"advance failed: evidence gate blocked transition: {evidence_reason}",
+                file=sys.stderr,
+            )
+            return 4  # Use exit code 4 for evidence gate block
+
     # SPEC-006: cost watcher. Two integration points:
     # 1. security-review -> review-passed when cost_watcher.enabled: redirect
     #    to cost-review first (transparent to callers). Done here, BEFORE the
@@ -874,6 +1053,146 @@ def cmd_evidence(args: argparse.Namespace) -> int:
     print(f"\nNext:")
     print(f"  (capture more evidence or advance state)")
     return 0
+
+
+# Phase 4: Extended evidence capture functions for new evidence kinds
+
+def capture_spec_validation(run_id: str, spec_path: str,
+                            target: Optional[str] = None) -> Tuple[bool, str]:
+    """Capture SPEC document validation evidence.
+
+    Args:
+        run_id: Run identifier
+        spec_path: Path to SPEC file
+        target: Repository root
+
+    Returns:
+        (ok, reason) tuple
+    """
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            spec_content = f.read()
+
+        # Basic validation: check YAML frontmatter
+        has_frontmatter = spec_content.strip().startswith("---")
+        has_gears_markers = any(
+            marker in spec_content.lower()
+            for marker in ["shall", "shall not", "where", "when", "while"]
+        )
+
+        summary = f"SPEC validation: frontmatter={has_frontmatter}, GEARS={has_gears_markers}"
+
+        # Record as evidence
+        ns = argparse.Namespace(
+            run_id=run_id,
+            kind="spec-validation",
+            summary=summary,
+            source_path=spec_path,
+            target=target,
+        )
+        return cmd_evidence(ns) == 0, summary
+
+    except Exception as e:
+        return False, f"SPEC validation failed: {e}"
+
+
+def capture_workflow_plan(run_id: str, plan: Dict[str, Any],
+                         target: Optional[str] = None) -> Tuple[bool, str]:
+    """Capture workflow plan as evidence.
+
+    Args:
+        run_id: Run identifier
+        plan: Workflow plan dictionary
+        target: Repository root
+
+    Returns:
+        (ok, reason) tuple
+    """
+    try:
+        # Serialize plan as JSON summary
+        plan_summary = json.dumps(plan, indent=2)
+        steps_count = len(plan.get("steps", []))
+        gates_count = len(plan.get("gates", []))
+
+        summary = f"Workflow plan: {steps_count} steps, {gates_count} gates"
+
+        # Record as evidence
+        ns = argparse.Namespace(
+            run_id=run_id,
+            kind="workflow-plan",
+            summary=summary,
+            source_path=None,  # Plan is in memory
+            target=target,
+        )
+        return cmd_evidence(ns) == 0, summary
+
+    except Exception as e:
+        return False, f"Workflow plan capture failed: {e}"
+
+
+def capture_metrics(run_id: str, metrics: Dict[str, Any],
+                    target: Optional[str] = None) -> Tuple[bool, str]:
+    """Capture performance/metric measurements as evidence.
+
+    Args:
+        run_id: Run identifier
+        metrics: Metrics dictionary
+        target: Repository root
+
+    Returns:
+        (ok, reason) tuple
+    """
+    try:
+        # Format metrics as summary
+        metric_lines = [f"{k}: {v}" for k, v in metrics.items()]
+        summary = f"Metrics: {', '.join(metric_lines[:5])}"  # Limit to 5 metrics
+
+        # Record as evidence
+        ns = argparse.Namespace(
+            run_id=run_id,
+            kind="metric-capture",
+            summary=summary,
+            source_path=None,
+            target=target,
+        )
+        return cmd_evidence(ns) == 0, summary
+
+    except Exception as e:
+        return False, f"Metrics capture failed: {e}"
+
+
+def capture_integration_test(run_id: str, test_output: str,
+                            target: Optional[str] = None) -> Tuple[bool, str]:
+    """Capture integration test results as evidence.
+
+    Args:
+        run_id: Run identifier
+        test_output: Test output string
+        target: Repository root
+
+    Returns:
+        (ok, reason) tuple
+    """
+    try:
+        # Parse test output for summary
+        lines = test_output.strip().split("\n")
+        passed = sum(1 for line in lines if "PASS" in line or "pass" in line.lower())
+        failed = sum(1 for line in lines if "FAIL" in line or "fail" in line.lower())
+
+        summary = f"Integration test: {passed} passed, {failed} failed"
+
+        # Record as evidence
+        ns = argparse.Namespace(
+            run_id=run_id,
+            kind="integration-test",
+            summary=summary,
+            source_path=None,
+            target=target,
+        )
+        return cmd_evidence(ns) == 0, summary
+
+    except Exception as e:
+        return False, f"Integration test capture failed: {e}"
 
 
 def cmd_end(args: argparse.Namespace) -> int:

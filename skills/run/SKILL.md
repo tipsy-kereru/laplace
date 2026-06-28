@@ -152,7 +152,57 @@ Workflow:
 
    SPEC-002 §Loop Limits names `human-approval-required` as the preferred terminal for this case. In the current state engine `review -> human-approval-required` is not wired as a legal transition (the legal path is `review -> blocked -> human-resolution`), so the orchestrator transitions to `blocked` and surfaces the fix-attempt history to the human. The human can then resolve via the exception flow (`blocked -> human-resolution -> <previous-state>`).
 
-### Step 5: Security phase (active in P5)
+### Step 5: Auditor phases (active in P6)
+
+Laplace runs independent auditors at critical workflow gates. Auditors spawn with fresh context (no bias from prior phases) and output PASS/FAIL/INCONCLUSIVE verdicts. FAIL verdicts block transitions.
+
+#### 5a. Plan Auditor (pm-review -> ready-for-dev)
+
+The plan auditor validates the workflow plan before execution begins. This gate enforces that the implementation plan is complete, coherent, feasible, and safe.
+
+Trigger:
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py advance <issue-id> pm-review ready-for-dev --summary "<PM ready>"
+```
+
+The runner automatically calls the plan auditor before completing the transition. The auditor checks:
+
+- **Completeness**: All acceptance criteria have implementation steps mapped
+- **Coherence**: Steps are logically ordered with dependencies identified
+- **Feasibility**: Required tools/dependencies are available
+- **Safety**: No prohibited commands or paths in the plan
+
+Outcomes:
+- **PASS**: Transition completes (`pm-review -> ready-for-dev`)
+- **FAIL**: Transition blocked, issue stays in `pm-review`. Surface auditor findings to human for plan revision.
+- **INCONCLUSIVE**: Logged but does not block (advisory)
+
+Evidence captured: `audit-report` with PASS/FAIL verdict and reasoning.
+
+#### 5b. Sync Auditor (security-review -> review-passed)
+
+The sync auditor validates the implementation result before the run completes. This gate enforces that all acceptance criteria have evidence, no regressions were introduced, and the implementation is safe.
+
+Trigger:
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py advance <issue-id> security-review review-passed --summary "<security clear>"
+```
+
+The runner automatically calls the sync auditor before completing the transition. The auditor checks:
+
+- **AC Satisfaction**: All acceptance criteria have corresponding evidence
+- **Regressions**: No new test failures or breaking changes
+- **Evidence Completeness**: Required evidence kinds are present
+- **Safety**: Security findings from security phase are resolved
+
+Outcomes:
+- **PASS**: Transition completes (`security-review -> review-passed`)
+- **FAIL**: Transition blocked, issue stays in `security-review`. Surface auditor findings to human for remediation.
+- **INCONCLUSIVE**: Logged but does not block (advisory)
+
+Evidence captured: `audit-report` with PASS/FAIL verdict and reasoning.
+
+### Step 6: Security phase (active in P5)
 
 Determine whether security review is required. If not already done in Step 4 (review agent recommended it), run the advisory trigger check:
 
@@ -216,7 +266,7 @@ The security agent returns one of `review-passed`, `needs-fix`, or `human-approv
 
   Surface the security findings + fix-attempt history to the human.
 
-### Step 6: End the run
+### Step 7: End the run
 
 ```
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py end <run-id> --outcome <final-state>
@@ -234,12 +284,22 @@ Evidence is appended to the run log's `evidence` array via:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/runner.py evidence <run-id> <kind> <path-or-text>
 ```
 
-- `kind` ∈ {`test`, `review`, `security`, `manual`, `command`}. Other values are rejected.
+- `kind` ∈ {`test`, `review`, `security`, `manual`, `command`, `reproduction`, `visual`, `spec-validation`, `workflow-plan`, `metric-capture`, `integration-test`, `audit-report`}. Other values are rejected.
 - If `<path-or-text>` is an existing file path, the file is read, redacted, capped at 1000 chars, and stored as `summary` with `source_path` set.
 - Otherwise the argument is treated as raw text, redacted, capped at 1000 chars, and stored as `summary` with no `source_path`.
 - Raw command output is never stored beyond the redacted 1000-char summary.
 
 Evidence MUST be captured before any pass transition (AC-LP-008).
+
+### Extended Evidence Kinds (Phase 4)
+
+The following evidence kinds are available for workflow automation:
+
+- `spec-validation`: SPEC/YAML frontmatter validation (captures document structure validation)
+- `workflow-plan`: Workflow plan document (captures generated execution plan)
+- `metric-capture`: Performance/metric measurements (captures benchmark results)
+- `integration-test`: Integration test results (captures E2E test outputs)
+- `audit-report`: Auditor verdicts (captures PASS/FAIL/INCONCLUSIVE decisions)
 
 ## Output Format
 
