@@ -7,5 +7,19 @@ Inspired by MoAI-ADK's Plan phase and LazyCodex's workflow generation.
 """
 
 from .planner import WorkflowComponent
+from .auto_generator import (
+    WorkflowAutoGenerator,
+    WorkflowPlan,
+    WorkflowStep,
+    QualityGate,
+    generate_workflow_from_spec,
+)
 
-__all__ = ["WorkflowComponent"]
+__all__ = [
+    "WorkflowComponent",
+    "WorkflowAutoGenerator",
+    "WorkflowPlan",
+    "WorkflowStep",
+    "QualityGate",
+    "generate_workflow_from_spec",
+]

@@ -10,5 +10,6 @@ Inspired by MoAI-ADK's Phase 0 (Intent) with Socratic interview pattern.
 """
 
 from .capturer import IntentComponent
+from .spec_generator import SpecGenerator, SpecDocument, generate_spec_from_prd
 
-__all__ = ["IntentComponent"]
+__all__ = ["IntentComponent", "SpecGenerator", "SpecDocument", "generate_spec_from_prd"]
