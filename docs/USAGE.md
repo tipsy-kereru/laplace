@@ -393,3 +393,126 @@ The existing `.github/workflows/release.yml` (unchanged) fires on tag push, vali
 | `run` says "not a git repo" | Working dir is not a git repo | `git init` in your project, or run elsewhere |
 | `create-pr` says `gh` not authenticated | `gh` missing or logged out | `! gh auth login` |
 | Loop keeps stopping at `human-approval-required` | Working as intended — that category needs a human | `/laplace:approve <issue>` then `/laplace:run <issue>` |
+
+---
+
+## Use case 8 — Auto-execution engine (v0.9.0+)
+
+Scenario: you want fully automated workflow execution from PRD to completion.
+
+### Overview
+
+The auto-execution engine implements:
+- **Conductor-workers pattern** (LazyCodex): specialized agents per phase
+- **Multi-phase workflows** (MoAI-ADK): analyze → design → implement → test → review
+- **Bounded iterations** (Ralph Loop): max 12 iterations by default
+- **Multi-dimensional completion** (goal/ultrawork): signal, evidence, convergence, state machine
+
+### Step 1 — Generate SPEC from PRD
+
+```
+/laplace:spec-gen docs/prd-login-rate-limit.md
+```
+
+Creates a GEARS-formatted SPEC document under `.harness/specs/`:
+
+```
+SPEC saved to .harness/specs/SPEC-20260628-120000.md
+```
+
+The SPEC includes:
+- **Given**: Requirements from PRD
+- **Effect**: Technical approach and design decisions
+- **Acceptance**: Criteria for validation
+- **Risks**: Potential blockers and mitigations
+- **Steps**: Implementation plan
+
+### Step 2 — Generate workflow from SPEC
+
+```
+/laplace:workflow-gen .harness/specs/SPEC-20260628-120000.md
+```
+
+Creates an executable workflow plan under `.harness/workflows/`:
+
+```
+Workflow plan saved to .harness/workflows/PLAN-20260628-120000.md
+```
+
+The workflow includes:
+- Step-by-step implementation plan
+- Evidence collection points
+- Quality gate definitions
+- Agent assignments per phase
+
+### Step 3 — Run auto-execution
+
+```
+python3 scripts/auto_engine.py docs/prd-login-rate-limit.md --target . --max-iterations 12 -v
+```
+
+Output:
+
+```
+[Laplace] Starting auto-execution from PRD: docs/prd-login-rate-limit.md
+[Laplace] Phase 1: Generating SPEC from PRD...
+[Laplace] ✓ SPEC generated: SPEC-20260628-120000
+[Laplace] Phase 2: Generating workflow from SPEC...
+[Laplace] ✓ Workflow generated: PLAN-20260628-120000
+[Laplace] Phase 3: Executing workflow...
+[Laplace] Executing 4 workflow steps...
+[Laplace]
+--- Iteration 1/12 ---
+[Laplace] Current step: Analyze Requirements (phase: analyze)
+[Laplace] ✓ Agent completed: completed
+...
+[Laplace] ✓ Workflow complete!
+```
+
+### Or use the one-shot command
+
+The auto-engine can run all phases in one command:
+
+```
+python3 scripts/auto_engine.py docs/prd-login-rate-limit.md
+```
+
+### Agent dispatch
+
+The auto-engine dispatches specialized agents for each phase:
+
+| Phase | Agent | Role |
+|-------|-------|------|
+| analyze | PM | Requirements clarification and scope definition |
+| design | Architect | Technical design and architecture |
+| implement | Dev | Implementation and coding |
+| test | QA | Testing and quality assurance |
+| review | Reviewer | Code review and validation |
+
+### Completion detection
+
+The engine uses multi-dimensional completion detection:
+
+- **Signal**: Explicit completion messages (`COMPLETE`, `DONE`, `SUCCESS`)
+- **Evidence**: Required evidence kinds captured (`test`, `review`, `audit-report`)
+- **Convergence**: Agent results stabilize over N iterations
+- **State Machine**: All workflow phases complete
+
+### Integration with manual workflow
+
+You can combine auto-engine with manual workflow:
+
+```
+# Generate SPEC and workflow automatically
+/laplace:spec-gen prd.md
+/laplace:workflow-gen .harness/specs/SPEC-*.md
+
+# Review and approve manually
+/laplace:intake prd.md
+/laplace:approve ISSUE-001
+
+# Run with auto-generated workflow
+/laplace:run ISSUE-001
+```
+
+For detailed auto-engine documentation, see [AUTO_ENGINE.md](AUTO_ENGINE.md).

@@ -51,6 +51,24 @@ Four opt-in features, all off by default — upgrading changes no existing loop:
 
 - **Freerange scope override** (SPEC-007) — `/laplace:freerange on {flow|publish|supply|all}` suppresses approval gates so the loop can run unattended. Human-only, scope-bounded, TTL-limited (24h default, 168h max). **Not a security boundary** — a determined agent can defeat it (same tier as all policy hooks). The deny layer (`rm -rf /`, `curl|sh`, `sudo`, cloud CLIs) is never suppressed. Practical patterns in [`docs/freerange-recipes.md`](docs/freerange-recipes.md).
 
+## What's new in 0.8.0
+
+- **Component-based architecture** — Modular component system under `components/` for intent, workflow, execution, verification, and release phases.
+- **Loop Ledger** — `.harness/loop/ledger.jsonl` for context survival across compaction and restart.
+- **Independent Auditors** — Plan-Auditor and Sync-Auditor gates with fresh context validation.
+- **Workflow Templates** — 7 predefined workflow templates (feature, bug-fix, security-fix, chore, refactoring, performance, dependency-update).
+- **Extended Evidence Kinds** — 5 new evidence types (spec-validation, workflow-plan, metric-capture, integration-test, audit-report).
+- **Orchestration Modes** — 4 modes (single, team, parallel, workflow) for different work patterns.
+
+## What's new in 0.9.0
+
+- **Auto-Execution Engine** — Automatic PRD → SPEC → Workflow → Agent execution → Completion loop.
+- **Spec Generator** — `/laplace:spec-gen` automatically generates GEARS-formatted SPEC documents from PRDs.
+- **Workflow Generator** — `/laplace:workflow-gen` automatically generates executable workflow plans from SPECs.
+- **Agent Dispatcher** — Phase-based automatic agent dispatch (PM → Architect → Dev → QA → Reviewer).
+- **Multi-dimensional Completion Detection** — Signal, Evidence, Convergence, and State Machine dimensions.
+- **Auto Engine Orchestrator** — `scripts/auto_engine.py` for end-to-end automated workflow execution.
+
 See `CHANGELOG.md` for the full version history.
 
 ---
@@ -207,6 +225,8 @@ The quick start below covers the happy path. The usage guide covers the edge cas
 
 A typical Laplace session, from spec to PR:
 
+### Method 1: Manual loop (classic)
+
 ```bash
 # 1. Prepare a PRD or story (markdown). E.g. docs/prd-login-rate-limit.md
 
@@ -229,6 +249,28 @@ A typical Laplace session, from spec to PR:
 /laplace:report ISSUE-001              # render the issue report
 /laplace:create-pr ISSUE-001           # open a GitHub PR after approval
 /laplace:cancel ISSUE-001              # stop a stuck loop safely (keeps state)
+```
+
+### Method 2: Auto-execution engine (v0.9.0+)
+
+For fully automated workflow execution:
+
+```bash
+# 1. Generate SPEC from PRD
+/laplace:spec-gen docs/prd-login-rate-limit.md
+#   → Creates GEARS-formatted SPEC under .harness/specs/
+
+# 2. Generate workflow plan from SPEC
+/laplace:workflow-gen .harness/specs/SPEC-*.md
+#   → Creates executable workflow plan under .harness/workflows/
+
+# 3. Run auto-execution engine (or use the script directly)
+python3 scripts/auto_engine.py docs/prd-login-rate-limit.md --target . --max-iterations 12 -v
+#   → Automatically executes: PRD → SPEC → Workflow → Agents → Completion
+#   Phases: Analyze (PM) → Design (Architect) → Implement (Dev) → Test (QA) → Review
+```
+
+The auto-engine orchestrates the entire workflow with bounded iterations and multi-dimensional completion detection. See `docs/AUTO_ENGINE.md` for details.
 ```
 
 At any gate that needs a human (auth change, dependency add, release, production touch), the loop **stops** and surfaces the decision. Resolve it, then `/laplace:run` again to resume.
@@ -374,6 +416,8 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:init` | Initialize `.harness/` runtime workspace |
 | `/laplace:doctor` | Check plugin, hooks, config, test commands, Moon Cell profile |
 | `/laplace:intake <prd>` | Convert PRD/story into local draft issues |
+| `/laplace:spec-gen <prd>` | Generate GEARS-formatted SPEC document from PRD (v0.9.0+) |
+| `/laplace:workflow-gen <spec>` | Generate executable workflow plan from SPEC (v0.9.0+) |
 | `/laplace:verify [prd]` | Check draft issues against the PRD (coverage, fields, traceability) |
 | `/laplace:approve <issue>` | Move draft issue to approved queue |
 | `/laplace:discard <issue>` | Remove a draft issue (atomic, draft-only) |
@@ -385,6 +429,7 @@ Slash commands live in `commands/` and invoke the corresponding procedural skill
 | `/laplace:cancel [issue]` | Stop active loop safely |
 | `/laplace:create-pr <issue>` | Create GitHub PR after approval |
 | `/laplace:release <X.Y.Z>` | Release a version: 8-check gate, bump 3 files, commit, tag, push (halt on failure) |
+| `auto_engine.py <prd>` | Auto-execution engine: PRD → SPEC → Workflow → Agents → Completion (v0.9.0+) |
 | `/laplace:list` | _(planned — P5/P6)_ List local issues and queue state |
 | `/laplace:show <issue>` | _(planned — P5/P6)_ Show issue details |
 | `/laplace:logs <run>` | _(planned — P5/P6)_ Show sanitized run logs |
