@@ -59,7 +59,9 @@ REDIRECT_OPS = (">", ">>")
 
 
 def _emit_allow() -> None:
-    sys.stdout.write(json.dumps({"decision": "allow"}))
+    # Modern Claude Code hook schema: permissionDecision=allow. Equivalent to
+    # empty stdout, but explicit is safer for older harnesses too.
+    sys.stdout.write(json.dumps({"permissionDecision": "allow"}))
     sys.exit(0)
 
 
@@ -71,7 +73,10 @@ def _emit_block(reason: str) -> None:
         reason = redact(reason)
     except Exception:
         pass
-    sys.stdout.write(json.dumps({"decision": "block", "reason": reason}))
+    sys.stdout.write(json.dumps({
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }))
     sys.exit(0)
 
 
@@ -284,11 +289,15 @@ def selftest() -> int:
         except json.JSONDecodeError:
             failures.append(f"{label}: non-JSON stdout: {out!r}")
             return
-        if decision.get("decision") != "block":
-            failures.append(f"{label}: decision={decision.get('decision')} (expected block)")
+        if decision.get("permissionDecision") != "deny":
+            failures.append(
+                f"{label}: permissionDecision={decision.get('permissionDecision')} (expected deny)"
+            )
             return
-        if expect_substring and expect_substring not in decision.get("reason", ""):
-            failures.append(f"{label}: reason={decision.get('reason')!r} missing {expect_substring!r}")
+        if expect_substring and expect_substring not in decision.get("permissionDecisionReason", ""):
+            failures.append(
+                f"{label}: reason={decision.get('permissionDecisionReason')!r} missing {expect_substring!r}"
+            )
 
     def _allow_case(payload: str, label: str) -> None:
         rc, out, err = _run_hook(payload)
@@ -303,7 +312,7 @@ def selftest() -> int:
                 return
             failures.append(f"{label}: non-JSON stdout: {out!r}")
             return
-        if decision.get("decision") == "block":
+        if decision.get("permissionDecision") == "deny":
             failures.append(f"{label}: blocked unexpectedly: {decision}")
 
     # Command denies.

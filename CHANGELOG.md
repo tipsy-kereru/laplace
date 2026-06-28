@@ -5,6 +5,19 @@ All notable changes to Laplace are documented here. Versions follow
 opt-in / off by default unless noted — existing loops are unchanged on
 upgrade.
 
+## [0.7.5] — 2026-06-28
+
+### Fixed
+
+- **Hook stdout schema (Laplace plugin).** `pretooluse.py` /
+  `posttooluse.py` emitted the legacy `{"decision": "allow" | "block"}`
+  contract, which recent Claude Code treats as invalid PreToolUse /
+  PostToolUse JSON output. PreToolUse now emits
+  `{"permissionDecision": "allow"}` (allow) or
+  `{"permissionDecision": "deny", "permissionDecisionReason": "..."}`
+  (deny). PostToolUse is observational and now emits `{}` — no decision
+  leaked. Selftests updated to assert the new keys.
+
 ## [0.7.4] — 2026-06-27
 
 ### Added

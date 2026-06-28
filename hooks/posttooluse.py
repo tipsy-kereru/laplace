@@ -175,7 +175,7 @@ def main() -> int:
     try:
         raw = sys.stdin.read()
     except Exception:  # pragma: no cover
-        sys.stdout.write(json.dumps({"decision": "allow"}))
+        sys.stdout.write("{}")
         return 0
 
     # Malformed JSON: fail open.
@@ -183,11 +183,11 @@ def main() -> int:
         payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
         sys.stderr.write("posttooluse: malformed JSON stdin, failing open\n")
-        sys.stdout.write(json.dumps({"decision": "allow"}))
+        sys.stdout.write("{}")
         return 0
 
     if not isinstance(payload, dict):
-        sys.stdout.write(json.dumps({"decision": "allow"}))
+        sys.stdout.write("{}")
         return 0
 
     tool_name = str(payload.get("tool_name") or "")
@@ -209,8 +209,9 @@ def main() -> int:
     except Exception as exc:  # pragma: no cover - never block on logging errors
         sys.stderr.write(f"posttooluse: handle error (failing open): {exc}\n")
 
-    # PostToolUse is non-blocking. Emit allow (empty stdout is also fine).
-    sys.stdout.write(json.dumps({"decision": "allow"}))
+    # PostToolUse is observational only — must NOT emit a decision.
+    # Empty JSON object is the safe no-op stdout.
+    sys.stdout.write("{}")
     return 0
 
 
